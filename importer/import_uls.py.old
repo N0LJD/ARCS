@@ -1,0 +1,355 @@
+import os
+import pathlib
+import zipfile
+import requests
+import pymysql
+
+# FCC ULS Amateur "Licenses" package (l_amat.zip)
+FCC_AMAT_URL = os.environ.get(
+    "FCC_AMAT_URL",
+    "https://data.fcc.gov/download/pub/uls/complete/l_amat.zip"
+)
+
+DATA_DIR = pathlib.Path(os.environ.get("DATA_DIR", "/data"))
+EXTRACT_DIR = DATA_DIR / "extract"
+ZIP_PATH = DATA_DIR / "l_amat.zip"
+
+DB_HOST = os.environ.get("DB_HOST", "uls-mariadb")
+DB_NAME = os.environ.get("DB_NAME", "uls")
+DB_USER = os.environ.get("DB_USER", "uls")
+DB_PASS = os.environ.get("DB_PASS", "")
+
+SCHEMA_PATH = pathlib.Path("/app/schema.sql")
+
+
+def download_zip(url: str, dest: pathlib.Path) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    # Skip download if file exists and is reasonably large (>50MB)
+    if dest.exists() and dest.stat().st_size > 50_000_000:
+        print(f"[SKIP] ZIP exists: {dest} ({dest.stat().st_size} bytes)")
+        return
+
+    print(f"[DL] {url}")
+    with requests.get(url, stream=True, timeout=180) as r:
+        r.raise_for_status()
+        with open(dest, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    f.write(chunk)
+
+    print(f"[OK] Downloaded: {dest} ({dest.stat().st_size} bytes)")
+
+
+def extract_zip(zip_path: pathlib.Path, extract_dir: pathlib.Path) -> None:
+    extract_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"[UNZIP] {zip_path} -> {extract_dir}")
+    with zipfile.ZipFile(zip_path, "r") as z:
+        z.extractall(extract_dir)
+
+    print("[OK] Extract complete")
+
+
+def to_utf8(src: pathlib.Path) -> pathlib.Path:
+    """
+    Convert FCC .dat to UTF-8 (safe for names/addresses).
+    Latin-1 decode never fails; replace handles odd bytes.
+    """
+    dst = src.with_suffix(src.suffix + ".utf8")
+    print(f"[ICONV] {src.name} -> {dst.name}")
+    with open(src, "rb") as f_in, open(dst, "wb") as f_out:
+        for line in f_in:
+            f_out.write(line.decode("latin-1", errors="replace").encode("utf-8"))
+    return dst
+
+
+def load_local_infile(conn, table: str, path: pathlib.Path, columns: str) -> None:
+    """
+    Load a UTF-8 .dat into a staging table.
+
+    We special-case HD and AM because:
+      - HD.dat has 59 fields and we only need a subset.
+      - AM.dat is where the real amateur operator class lives (field 6).
+    """
+    print(f"[LOAD] {table} <- {path.name}")
+
+    with conn.cursor() as cur:
+        # Truncate staging first to keep loads deterministic
+        cur.execute(f"TRUNCATE TABLE {table};")
+
+        # HD.dat (59 fields): do NOT attempt to load operator class from HD.
+        # We load only the core license header fields we need.
+        if table == "stg_hd":
+            vars_list = ", ".join([f"@f{i}" for i in range(1, 60)])  # @f1..@f59
+
+            sql = f"""
+LOAD DATA LOCAL INFILE '{path.as_posix()}'
+INTO TABLE stg_hd
+CHARACTER SET utf8mb4
+FIELDS TERMINATED BY '|'
+LINES TERMINATED BY '\\n'
+({vars_list})
+SET
+  record_type = NULLIF(@f1,''),
+  unique_system_identifier = NULLIF(@f2,''),
+  call_sign = NULLIF(@f5,''),
+  license_status = NULLIF(@f6,''),
+  grant_date = NULLIF(@f8,''),
+  expired_date = NULLIF(@f9,''),
+  last_action_date = NULLIF(@f10,'');
+"""
+            cur.execute(sql)
+            print(f"[OK] Loaded {table} (HD mapped fields: 1,2,5,6,8,9,10)")
+            return
+
+        # AM.dat (18 fields): operator class (T/G/A/E/N) is field 6
+        if table == "stg_am":
+            vars_list = ", ".join([f"@f{i}" for i in range(1, 19)])  # @f1..@f18
+
+            sql = f"""
+LOAD DATA LOCAL INFILE '{path.as_posix()}'
+INTO TABLE stg_am
+CHARACTER SET utf8mb4
+FIELDS TERMINATED BY '|'
+LINES TERMINATED BY '\\n'
+({vars_list})
+SET
+  record_type = NULLIF(@f1,''),
+  unique_system_identifier = NULLIF(@f2,''),
+  uls_file_number = NULLIF(@f3,''),
+  ebf_number = NULLIF(@f4,''),
+  call_sign = NULLIF(@f5,''),
+  operator_class = NULLIF(@f6,'');
+"""
+            cur.execute(sql)
+            print(f"[OK] Loaded {table} (AM mapped fields: 1,2,3,4,5,6[class])")
+            return
+
+        # Default loader (EN, etc.) using the provided column list
+        sql = f"""
+LOAD DATA LOCAL INFILE '{path.as_posix()}'
+INTO TABLE {table}
+CHARACTER SET utf8mb4
+FIELDS TERMINATED BY '|'
+LINES TERMINATED BY '\\n'
+({columns});
+"""
+        cur.execute(sql)
+
+    print(f"[OK] Loaded {table}")
+
+
+def merge_into_final(conn) -> None:
+    """
+    Merge staging tables into final tables.
+
+    NOTE: We intentionally source operator class from AM.dat, not HD.dat.
+    """
+    print("[DB] Merging staging -> final tables")
+
+    with conn.cursor() as cur:
+        # stg_hd -> hd (license header)
+        cur.execute("""
+            INSERT INTO hd (
+                record_type,
+                unique_system_identifier,
+                call_sign,
+                license_status,
+                grant_date,
+                expired_date,
+                last_action_date
+            )
+            SELECT
+                record_type,
+                unique_system_identifier,
+                LEFT(TRIM(call_sign), 10),
+                LEFT(TRIM(license_status), 1),
+                STR_TO_DATE(NULLIF(grant_date,''), '%m/%d/%Y'),
+                STR_TO_DATE(NULLIF(expired_date,''), '%m/%d/%Y'),
+                STR_TO_DATE(NULLIF(last_action_date,''), '%m/%d/%Y')
+            FROM stg_hd
+            WHERE unique_system_identifier IS NOT NULL
+            ON DUPLICATE KEY UPDATE
+                call_sign=VALUES(call_sign),
+                license_status=VALUES(license_status),
+                grant_date=VALUES(grant_date),
+                expired_date=VALUES(expired_date),
+                last_action_date=VALUES(last_action_date);
+        """)
+
+        # stg_en -> en (entity / name / address)
+        cur.execute("""
+            INSERT INTO en (
+                record_type,
+                unique_system_identifier,
+                call_sign,
+                entity_name,
+                first_name,
+                last_name,
+                street_address,
+                city,
+                state,
+                zip_code
+            )
+            SELECT
+                record_type,
+                unique_system_identifier,
+                LEFT(TRIM(call_sign), 10),
+                NULLIF(TRIM(entity_name),''),
+                NULLIF(TRIM(first_name),''),
+                NULLIF(TRIM(last_name),''),
+                NULLIF(TRIM(street_address),''),
+                NULLIF(TRIM(city),''),
+                LEFT(TRIM(state), 2),
+                LEFT(TRIM(zip_code), 10)
+            FROM stg_en
+            WHERE unique_system_identifier IS NOT NULL
+            ON DUPLICATE KEY UPDATE
+                call_sign=VALUES(call_sign),
+                entity_name=VALUES(entity_name),
+                first_name=VALUES(first_name),
+                last_name=VALUES(last_name),
+                street_address=VALUES(street_address),
+                city=VALUES(city),
+                state=VALUES(state),
+                zip_code=VALUES(zip_code);
+        """)
+
+        # stg_am -> am (operator class / license class)
+        cur.execute("""
+            INSERT INTO am (unique_system_identifier, call_sign, operator_class)
+            SELECT
+                unique_system_identifier,
+                LEFT(TRIM(call_sign), 10),
+                LEFT(TRIM(operator_class), 1)
+            FROM stg_am
+            WHERE unique_system_identifier IS NOT NULL
+            ON DUPLICATE KEY UPDATE
+                call_sign=VALUES(call_sign),
+                operator_class=VALUES(operator_class);
+        """)
+
+    print("[OK] Merge complete")
+
+
+def connect_db():
+    """
+    Connect to MariaDB with LOCAL INFILE enabled (required for LOAD DATA LOCAL INFILE).
+    Use DictCursor so COUNT(*) queries are easy and consistent.
+    """
+    return pymysql.connect(
+        host=DB_HOST,
+        user=DB_USER,
+        password=DB_PASS,
+        database=DB_NAME,
+        autocommit=True,
+        local_infile=True,
+        charset="utf8mb4",
+        cursorclass=pymysql.cursors.DictCursor,
+    )
+
+
+def apply_schema(conn) -> None:
+    """
+    Apply schema.sql on each run.
+    Keep schema.sql idempotent (CREATE TABLE IF NOT EXISTS, CREATE OR REPLACE VIEW, etc.)
+    """
+    sql = SCHEMA_PATH.read_text(encoding="utf-8")
+    statements = [s.strip() for s in sql.split(";") if s.strip()]
+
+    print(f"[DB] Applying schema ({len(statements)} statements)")
+    with conn.cursor() as cur:
+        for stmt in statements:
+            cur.execute(stmt + ";")
+    print("[OK] Schema applied")
+
+
+def main():
+    print("[START] ULS import starting")
+
+    # 1) Ensure directories exist
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    # 2) Apply schema
+    conn = connect_db()
+    try:
+        apply_schema(conn)
+    finally:
+        conn.close()
+
+    # 3) Download FCC file
+    download_zip(FCC_AMAT_URL, ZIP_PATH)
+
+    # 4) Extract and verify expected files exist
+    extract_zip(ZIP_PATH, EXTRACT_DIR)
+
+    hd = EXTRACT_DIR / "HD.dat"
+    en = EXTRACT_DIR / "EN.dat"
+    am = EXTRACT_DIR / "AM.dat"
+
+    for f in (hd, en, am):
+        if not f.exists():
+            raise SystemExit(f"[ERR] Missing {f} after extract")
+
+    print(f"[OK] Found: {hd} ({hd.stat().st_size} bytes)")
+    print(f"[OK] Found: {en} ({en.stat().st_size} bytes)")
+    print(f"[OK] Found: {am} ({am.stat().st_size} bytes)")
+
+    # 5) Convert to UTF-8 for safe loading
+    hd_u8 = to_utf8(hd)
+    en_u8 = to_utf8(en)
+    am_u8 = to_utf8(am)
+
+    # 6) Load into DB (staging tables), then merge to final
+    conn = connect_db()
+    try:
+        # EN staging columns (must match your stg_en table definition)
+        stg_en_cols = ",".join([
+            "record_type","unique_system_identifier","uls_file_number","ebf_number","call_sign",
+            "entity_type","licensee_id","entity_name","first_name","mi","last_name","suffix",
+            "phone","fax","email","street_address","city","state","zip_code","po_box",
+            "attention_line","sgin","frn"
+        ])
+
+        # For stg_hd and stg_am, the loader ignores `columns` due to explicit mapping.
+        load_local_infile(conn, "stg_hd", hd_u8, "record_type")
+        load_local_infile(conn, "stg_en", en_u8, stg_en_cols)
+        load_local_infile(conn, "stg_am", am_u8, "record_type")
+
+        merge_into_final(conn)
+
+        # Diagnostics: final table counts
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS c FROM hd;")
+            hd_count = cur.fetchone()["c"]
+            cur.execute("SELECT COUNT(*) AS c FROM en;")
+            en_count = cur.fetchone()["c"]
+            cur.execute("SELECT COUNT(*) AS c FROM am;")
+            am_count = cur.fetchone()["c"]
+
+            # Diagnostics: class distribution (top few)
+            cur.execute("""
+                SELECT operator_class, COUNT(*) AS cnt
+                FROM am
+                GROUP BY operator_class
+                ORDER BY cnt DESC
+                LIMIT 10;
+            """)
+            class_rows = cur.fetchall()
+
+        print(f"[DONE] Loaded: hd={hd_count} en={en_count} am={am_count}")
+        print("[DIAG] License class distribution (am.operator_class):")
+        for r in class_rows:
+            oc = r["operator_class"]
+            cnt = r["cnt"]
+            print(f"  class={oc if oc is not None else 'NULL'} cnt={cnt}")
+
+    finally:
+        conn.close()
+
+    print("[END] ULS import complete")
+
+
+if __name__ == "__main__":
+    main()

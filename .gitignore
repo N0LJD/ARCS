@@ -1,0 +1,50 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Logs
+*.log
+
+# Local env / secrets
+.env
+.env.*
+*secrets*
+*password*
+*.key
+*.pem
+id_rsa*
+*.p12
+*.pfx
+
+# Database / data artifacts (do NOT commit)
+data/
+db-data/
+mariadb-data/
+mysql-data/
+*.db
+*.sqlite
+*.sqlite3
+*.sql.gz
+*.dump
+*.bak
+
+# FCC downloads / extracts (common names)
+*.zip
+extract/
+downloads/
+uls/
+l_amat.zip
+
+# Compose overrides / local resolved configs (optional)
+compose.resolved.yml
+docker-compose.override.yml

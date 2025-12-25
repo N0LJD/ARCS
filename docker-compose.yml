@@ -1,0 +1,205 @@
+services:
+  # ---------------------------------------------------------------------------
+  # Docker Compose for HamCall
+  # Edward Moss - N0LJD
+  #
+  #
+  # ---------------------------------------------------------------------------
+  # MariaDB (persistent database)
+  # ---------------------------------------------------------------------------
+  # Stores the imported FCC ULS tables:
+  #   - hd (license header)
+  #   - en (entity/name/address)
+  #   - am (operator class, sourced from AM.dat)
+  #   - staging tables (stg_*) used during each import
+  #
+  # This container is long-running and persists data to the uls_db_data volume.
+  #
+  uls-mariadb:
+    image: mariadb:11
+    container_name: uls-mariadb
+    environment:
+      # MariaDB will create this database and user on first boot (if data dir empty)
+      MARIADB_DATABASE: uls
+      MARIADB_USER: uls
+      MARIADB_PASSWORD: HgQzfYLd6
+
+      # Root password for admin access (used by healthcheck command below)
+      MARIADB_ROOT_PASSWORD: 6SpfBdgW8
+
+      # Container timezone (useful for logs)
+      TZ: America/Chicago
+
+    command:
+      # Character set / collation (ensure consistent Unicode handling)
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+
+      # Required for bulk import method used by importer (LOAD DATA LOCAL INFILE)
+      - --local-infile=1
+
+      # Performance-friendly settings for bulk loads.
+      # These trade durability for speed during large imports.
+      # Safe for this use case because the source data can be re-imported.
+      - --innodb_flush_log_at_trx_commit=2
+      - --sync_binlog=0
+
+      # Avoid reverse DNS lookups on client connect (faster and less error-prone)
+      - --skip-name-resolve
+
+    volumes:
+      # Persistent database storage
+      - uls_db_data:/var/lib/mysql
+      - ./db-init:/docker-entrypoint-initdb.d:ro
+      - ./xml-api/app.py:/app/app.py:ro
+
+    networks:
+      # Only attached to the private DB network.
+      # No published ports means it is not reachable from outside Docker by default.
+      - uls_db_net
+
+    healthcheck:
+      # Used by docker to verify DB is up and accepting connections
+      test: ["CMD", "mariadb-admin", "ping", "-h", "127.0.0.1", "-uroot", "-p6SpfBdgW8"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+    restart: unless-stopped
+
+
+  # ---------------------------------------------------------------------------
+  # Importer (one-shot job container)
+  # ---------------------------------------------------------------------------
+  # This service is NOT meant to be "up" continuously. It is run on-demand via:
+  #   docker compose run --rm uls-importer
+  #
+  # It performs:
+  #   1) apply schema.sql (tables + v_callbook view)
+  #   2) download + extract FCC l_amat.zip (unless already present)
+  #   3) load staging tables via LOAD DATA LOCAL INFILE
+  #   4) merge into final tables
+  #   5) print diagnostics
+  #
+  # Scheduling is handled by /opt/hamcall/run-weekly-import.sh (cron-safe with flock).
+  #
+  uls-importer:
+    build: ./importer
+    container_name: uls-importer
+    depends_on:
+      uls-mariadb:
+        condition: service_healthy
+
+    environment:
+      # DB connection points at the service name on the docker network
+      DB_HOST: uls-mariadb
+      DB_NAME: uls
+      DB_USER: uls
+      DB_PASS: HgQzfYLd6
+
+      # Import working directory (docker volume mounted at /data)
+      DATA_DIR: /data
+
+      TZ: America/Chicago
+
+    volumes:
+      # Cache volume for FCC zip + extracted files. This speeds up repeated runs
+      # and avoids re-downloading unless the zip is deleted.
+      - uls_cache:/data
+
+      # Bind-mount these files to make edits persistent without rebuilding the image.
+      # This is critical for keeping view logic (e.g., 'Club' mapping) consistent
+      # across "from scratch" rebuilds.
+      - ./importer/schema.sql:/app/schema.sql:ro
+      - ./importer/import_uls.py:/app/import_uls.py:ro
+
+    networks:
+      # Needs DB access
+      - uls_db_net
+
+      # Also attached to external network (not strictly required for DB access).
+      # If you want to harden further, you can remove uls_ext_net from the importer
+      # and it will still work as long as it can reach the FCC URL (it can via default routing).
+      - uls_ext_net
+
+    # This is a job container; it should not restart automatically
+    restart: "no"
+
+
+  # ---------------------------------------------------------------------------
+  # XML API (public query service)
+  # ---------------------------------------------------------------------------
+  # Long-running API container that serves queries from the callbook view:
+  #   v_callbook (hd + en + am + derived fields)
+  #
+  # It uses a read-only DB user (callbook_ro).
+  #
+  xml-api:
+    build: ./xml-api
+    container_name: xml-api
+    depends_on:
+      uls-mariadb:
+        condition: service_healthy
+
+    environment:
+      DB_HOST: uls-mariadb
+      DB_NAME: uls
+
+      # Recommended: DB user with SELECT-only permissions
+      DB_USER: callbook_ro
+      DB_PASS: 42XcgBo4p
+
+      TZ: America/Chicago
+
+    volumes:
+      - ./xml-api/app.py:/app/app.py:ro
+
+    networks:
+      # Needs DB access
+      - uls_db_net
+
+      # Needs external access because we publish a port on the host.
+      - uls_ext_net
+
+    ports:
+      # Host port 8080 -> container port 8000 (uvicorn default in your container)
+      - "8080:8000"
+
+    restart: unless-stopped
+
+
+
+# -----------------------------------------------------------------------------
+# Networks
+# -----------------------------------------------------------------------------
+networks:
+  # Private/internal DB network.
+  #
+  # internal: true means containers on this network cannot reach external networks.
+  # This is good for hardening the DB plane.
+  #
+  # Note: this does NOT publish ports. A container is only reachable from outside
+  # Docker if you explicitly publish ports under "ports:".
+  #
+  uls_db_net:
+    name: uls_db_net
+    driver: bridge
+    internal: true
+
+  # External-facing network for services that need host port publishing (xml-api).
+  # Containers on this network can make outbound connections.
+  uls_ext_net:
+    name: uls_ext_net
+    driver: bridge
+
+
+# -----------------------------------------------------------------------------
+# Volumes
+# -----------------------------------------------------------------------------
+volumes:
+  # Persistent database storage (keeps data across container rebuilds)
+  uls_db_data:
+
+  # Persistent cache for FCC downloads/extracts (makes repeat imports faster)
+  uls_cache:
