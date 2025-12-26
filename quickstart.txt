@@ -1,0 +1,137 @@
+HamCall - Quick Start Guide
+Edward Moss, N0LJD
+
+-----------------------------------------------------------------------
+
+PURPOSE
+
+This quick start walks through bringing HamCall online from a fresh
+checkout, including password setup, container startup, initial import,
+and a basic verification query.
+
+It assumes:
+
+	Docker + Docker Compose are installed
+	You are working from /opt/hamcall
+	You have outbound internet access for FCC downloads
+
+-----------------------------------------------------------------------
+ 
+STEP 1 - CREATE SECRETS
+
+Create the secrets directory:
+
+	mkdir -p /opt/hamcall/secrets
+	chmod 700 /opt/hamcall/secrets
+
+Create the required password files (one password per file):
+
+	/opt/hamcall/secrets/mariadb_root_password.txt
+	/opt/hamcall/secrets/mariadb_user_password.txt
+	/opt/hamcall/secrets/callbook_ro_password.txt
+
+Example:
+
+	echo 'STRONG_ROOT_PASSWORD' > secrets/mariadb_root_password.txt
+	echo 'STRONG_ULS_PASSWORD' > secrets/mariadb_user_password.txt
+	echo 'STRONG_RO_PASSWORD' > secrets/callbook_ro_password.txt
+
+Lock them down:
+
+	chmod 600 /opt/hamcall/secrets/*.txt
+
+-----------------------------------------------------------------------
+
+STEP 2 - VALIDATE DOCKER COMPOSE CONFIG
+
+From /opt/hamcall:
+
+	docker compose config >/dev/null && echo "Compose syntax OK"
+
+If this fails, fix YAML errors before proceeding.
+
+-----------------------------------------------------------------------
+
+STEP 3 - START CORE SERVICES
+
+Start the database and API containers:
+	docker compose up -d uls-mariadb xml-api
+	Wait for MariaDB to become healthy:
+	docker compose ps
+
+You should see:
+	uls-mariadb: healthy
+	xml-api: running
+
+-----------------------------------------------------------------------
+
+STEP 4 - RUN INITIAL FCC IMPORT
+
+Run the importer manually (first run may take several minutes):
+	docker compose run --rm uls-importer
+
+Expected behavior:
+	FCC ZIP is downloaded (or reused if cached)
+	Data files are extracted
+	Tables and views are built
+	Diagnostics are printed at the end
+	A successful run ends with:
+	[END] ULS import complete
+
+-----------------------------------------------------------------------
+
+STEP 5 - VERIFY READ-ONLY ACCESS
+
+Run the sanity check:
+	./sanity_check.sh
+
+You should see:
+	RO user can SELECT from v_callbook
+	RO user is blocked from base tables
+	API returns valid XML
+
+-----------------------------------------------------------------------
+
+STEP 6 - TEST THE XML API
+
+From the host:
+	curl http://localhost:8080/xml.php?callsign=W1AW
+
+Expected:
+	HTTP 200
+	Content-Type: application/xml; charset=utf-8
+	XML response containing W1AW data
+
+-----------------------------------------------------------------------
+
+STEP 7 - (OPTIONAL) SCHEDULE WEEKLY IMPORT
+
+Edit root's crontab:
+	crontab -e
+
+Add:
+	15 3 * * 5 /opt/hamcall/run-weekly-import.sh >> /var/log/uls-import.log 2>&1
+	This runs the importer weekly (Friday at 03:15).
+
+-----------------------------------------------------------------------
+
+COMMON QUICK FIXES
+
+Importer fails authentication:
+
+	Check secrets are mounted
+	Verify DB_PASS_FILE is set in importer container
+
+API returns Backend error:
+	Confirm MariaDB is healthy
+	Confirm callbook_ro grants exist
+
+Database empty:
+	Importer has not been run
+	Persistent volume was removed
+DONE
+
+HamCall is now online.
+
+For full architecture, security model, and maintenance notes,
+see README.txt.

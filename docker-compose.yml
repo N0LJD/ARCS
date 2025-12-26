@@ -15,6 +15,7 @@ services:
   #
   # This container is long-running and persists data to the uls_db_data volume.
   #
+
   uls-mariadb:
     image: mariadb:11
     container_name: uls-mariadb
@@ -22,13 +23,17 @@ services:
       # MariaDB will create this database and user on first boot (if data dir empty)
       MARIADB_DATABASE: uls
       MARIADB_USER: uls
-      MARIADB_PASSWORD: HgQzfYLd6
+      MARIADB_PASSWORD_FILE: /run/secrets/mariadb_user_password
 
       # Root password for admin access (used by healthcheck command below)
-      MARIADB_ROOT_PASSWORD: 6SpfBdgW8
+      MARIADB_ROOT_PASSWORD_FILE: /run/secrets/mariadb_root_password
 
       # Container timezone (useful for logs)
       TZ: America/Chicago
+
+    secrets:
+      - mariadb_root_password
+      - mariadb_user_password
 
     command:
       # Character set / collation (ensure consistent Unicode handling)
@@ -51,7 +56,6 @@ services:
       # Persistent database storage
       - uls_db_data:/var/lib/mysql
       - ./db-init:/docker-entrypoint-initdb.d:ro
-      - ./xml-api/app.py:/app/app.py:ro
 
     networks:
       # Only attached to the private DB network.
@@ -60,7 +64,10 @@ services:
 
     healthcheck:
       # Used by docker to verify DB is up and accepting connections
-      test: ["CMD", "mariadb-admin", "ping", "-h", "127.0.0.1", "-uroot", "-p6SpfBdgW8"]
+      # Read root password from secret file to avoid hardcoding creds in compose.
+      test:
+        - CMD-SHELL
+        - mariadb-admin ping -h 127.0.0.1 -uroot -p"$(cat /run/secrets/mariadb_root_password)" --silent
       interval: 10s
       timeout: 5s
       retries: 12
@@ -96,12 +103,15 @@ services:
       DB_HOST: uls-mariadb
       DB_NAME: uls
       DB_USER: uls
-      DB_PASS: HgQzfYLd6
+      DB_PASS_FILE: /run/secrets/mariadb_user_password
 
       # Import working directory (docker volume mounted at /data)
       DATA_DIR: /data
 
       TZ: America/Chicago
+
+    secrets:
+      - mariadb_user_password
 
     volumes:
       # Cache volume for FCC zip + extracted files. This speeds up repeated runs
@@ -138,6 +148,7 @@ services:
   xml-api:
     build: ./xml-api
     container_name: xml-api
+
     depends_on:
       uls-mariadb:
         condition: service_healthy
@@ -145,28 +156,24 @@ services:
     environment:
       DB_HOST: uls-mariadb
       DB_NAME: uls
-
-      # Recommended: DB user with SELECT-only permissions
       DB_USER: callbook_ro
-      DB_PASS: 42XcgBo4p
-
+      DB_PASS_FILE: /run/secrets/callbook_ro_password
       TZ: America/Chicago
 
-    volumes:
-      - ./xml-api/app.py:/app/app.py:ro
+    secrets:
+      - callbook_ro_password
 
     networks:
-      # Needs DB access
       - uls_db_net
-
-      # Needs external access because we publish a port on the host.
       - uls_ext_net
 
     ports:
-      # Host port 8080 -> container port 8000 (uvicorn default in your container)
       - "8080:8000"
 
     restart: unless-stopped
+
+    volumes:
+      - ./xml-api/app.py:/app/app.py:ro
 
 
 
@@ -203,3 +210,17 @@ volumes:
 
   # Persistent cache for FCC downloads/extracts (makes repeat imports faster)
   uls_cache:
+
+
+# -----------------------------------------------------------------------------
+# Secrets
+# -----------------------------------------------------------------------------
+secrets:
+  mariadb_root_password:
+    file: ./secrets/mariadb_root_password.txt
+
+  mariadb_user_password:
+    file: ./secrets/mariadb_user_password.txt
+
+  callbook_ro_password:
+    file: ./secrets/callbook_ro_password.txt

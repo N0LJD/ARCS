@@ -69,30 +69,33 @@ import pymysql
 APP_TITLE = "HamQTH-style Callsign XML"
 app = FastAPI(title=APP_TITLE)
 
-# Database connection settings are controlled via environment variables.
-# Defaults align with docker-compose service naming (DB_HOST=uls-mariadb).
 DB_HOST = os.environ.get("DB_HOST", "uls-mariadb")
 DB_NAME = os.environ.get("DB_NAME", "uls")
 DB_USER = os.environ.get("DB_USER", "callbook_ro")
+
+# Password may be provided directly (DB_PASS) or via a mounted secret file (DB_PASS_FILE).
+# DB_PASS_FILE takes precedence if set.
 DB_PASS = os.environ.get("DB_PASS", "")
+DB_PASS_FILE = os.environ.get("DB_PASS_FILE")
+
+
+def _read_secret(path: str) -> str:
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read().strip()
+
+
+if DB_PASS_FILE:
+    DB_PASS = _read_secret(DB_PASS_FILE)
 
 # Basic callsign sanity check. Allows letters/numbers and portable suffix like /P, /MM, etc.
 CALLSIGN_RE = re.compile(r"^[A-Z0-9/]{1,16}$")
 
-# Canonical media type for XML responses (keeps clients and docs consistent).
-# NOTE: Some frameworks drop charset from media_type; we force it via XML_HEADERS.
-XML_MEDIA_TYPE = "application/xml"
+# Canonical media type for XML responses (keeps clients and docs consistent)
+XML_MEDIA_TYPE = "application/xml; charset=utf-8"
 XML_HEADERS = {"Content-Type": "application/xml; charset=utf-8"}
 
 
 def db_conn():
-    """
-    Create a MariaDB/MySQL connection for a single request.
-
-    Notes:
-    - autocommit=True because this API is read-only; we don't need explicit transaction mgmt.
-    - DictCursor gives us rows as dicts, simplifying field mapping into XML tags.
-    """
     return pymysql.connect(
         host=DB_HOST,
         user=DB_USER,
@@ -105,12 +108,6 @@ def db_conn():
 
 
 def xml_escape(s: str) -> str:
-    """
-    Minimal XML escaping for content inserted into XML tags.
-
-    This is not a full XML serializer, but is sufficient for simple tag content.
-    Caller is expected to pass a string (see helper f() below).
-    """
     return (
         s.replace("&", "&amp;")
         .replace("<", "&lt;")
@@ -121,12 +118,6 @@ def xml_escape(s: str) -> str:
 
 
 def hamqth_error_xml(callsign: str, message: str, result: int = 0) -> str:
-    """
-    Build a HamQTH-style XML response for errors and "not found" cases.
-
-    We always generate a session_id and include the error message in both
-    <session><error> and <search><error> to match common HamQTH client expectations.
-    """
     sid = str(uuid.uuid4())
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <HamQTH version="2.0">
@@ -158,11 +149,6 @@ def hamqth_error_xml(callsign: str, message: str, result: int = 0) -> str:
     },
 )
 def health():
-    """
-    Health check endpoint.
-
-    Returns JSON so it is easy for monitors, load balancers, and orchestration tools to parse.
-    """
     return {"ok": True, "service": APP_TITLE}
 
 
@@ -205,11 +191,7 @@ def health():
     openapi_extra={
         "responses": {
             "200": {
-                "content": {
-                    "application/xml": {
-                        "schema": {"type": "string"}
-                    }
-                }
+                "content": {"application/xml": {"schema": {"type": "string"}}}
             }
         }
     },
@@ -224,7 +206,6 @@ def lookup(
 
     Returns XML.
     """
-    # Normalize callsign for lookup and consistent validation.
     cs = callsign.strip().upper()
 
     # Validate callsign (basic)
@@ -233,9 +214,6 @@ def lookup(
         return Response(content=xml, media_type=XML_MEDIA_TYPE, headers=XML_HEADERS)
 
     # Query DB
-    #
-    # We query the view v_callbook (not base tables). This reduces DB privileges
-    # required by the API user and stabilizes the API contract.
     try:
         with db_conn() as conn:
             with conn.cursor() as cur:
@@ -252,7 +230,6 @@ def lookup(
                 )
                 rows = cur.fetchall()
     except Exception:
-        # Avoid leaking DB details; return a HamQTH-style "Backend error".
         xml = hamqth_error_xml(cs, "Backend error", result=0)
         return Response(content=xml, media_type=XML_MEDIA_TYPE, headers=XML_HEADERS)
 
@@ -260,23 +237,15 @@ def lookup(
         xml = hamqth_error_xml(cs, "Callsign not found", result=0)
         return Response(content=xml, media_type=XML_MEDIA_TYPE, headers=XML_HEADERS)
 
-    # Return the "best" match:
-    # - The SQL ORDER BY prefers Active licenses, then most recent expirations/grants.
+    # Return the "best" match
     r = rows[0]
 
     def f(k: str) -> str:
-        """
-        Convenience accessor for DB fields -> XML-safe text.
-        - Converts NULL to empty tag content.
-        - Stringifies non-NULL values and escapes XML special chars.
-        """
         v = r.get(k)
         return "" if v is None else xml_escape(str(v))
 
     sid = str(uuid.uuid4())
 
-    # Map fields from v_callbook into a HamQTH-ish set of tags.
-    # This is intentionally minimal and can be expanded later if clients need more fields.
     xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <HamQTH version="2.0">
   <session>

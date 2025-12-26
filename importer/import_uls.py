@@ -46,10 +46,20 @@ EXTRACT_DIR = DATA_DIR / "extract"
 ZIP_PATH = DATA_DIR / "l_amat.zip"
 
 # MariaDB connection settings (service name "uls-mariadb" when using docker compose)
+def _read_secret(path: str) -> str:
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read().strip()
+
 DB_HOST = os.environ.get("DB_HOST", "uls-mariadb")
 DB_NAME = os.environ.get("DB_NAME", "uls")
 DB_USER = os.environ.get("DB_USER", "uls")
+
+# Password may be provided directly (DB_PASS) or via a mounted secret file (DB_PASS_FILE).
+# DB_PASS_FILE takes precedence if set.
 DB_PASS = os.environ.get("DB_PASS", "")
+DB_PASS_FILE = os.environ.get("DB_PASS_FILE")
+if DB_PASS_FILE:
+    DB_PASS = _read_secret(DB_PASS_FILE)
 
 # Schema file path inside the importer container
 SCHEMA_PATH = pathlib.Path("/app/schema.sql")
