@@ -175,6 +175,21 @@ services:
     volumes:
       - ./xml-api/app.py:/app/app.py:ro
 
+  # ---------------------------------------------------------------------------
+  # WEB-UI (public web service)
+  # ---------------------------------------------------------------------------
+  # 
+  web-ui:
+    build: ./web-ui
+    container_name: web-ui
+    environment:
+      - UI_API_BASE_URL=/api
+    ports:
+      - "8081:80"
+    depends_on:
+      - xml-api
+    networks:
+      - uls_ext_net
 
 
 # -----------------------------------------------------------------------------

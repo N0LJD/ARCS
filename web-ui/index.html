@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>ARCS - Amateur Radio Call Search</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }
+    h1 { margin: 0 0 8px; }
+    .muted { color: #666; font-size: 0.95rem; line-height: 1.35; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 16px; margin: 16px 0; }
+    label { display: block; font-weight: 600; margin-top: 10px; }
+    input, select { width: 100%; max-width: 520px; padding: 10px; border: 1px solid #ccc; border-radius: 8px; }
+    input[readonly] { background: #f8f8f8; }
+    .row { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
+    .btns { margin-top: 14px; display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+    button { padding: 10px 14px; border: 1px solid #333; background: #111; color: #fff; border-radius: 8px; cursor: pointer; }
+    button.secondary { background: #fff; color: #111; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .warn { color: #8a4b00; white-space: pre-wrap; }
+    .err { color: #b00020; white-space: pre-wrap; }
+    table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+    th, td { border-bottom: 1px solid #eee; padding: 8px; text-align: left; vertical-align: top; }
+    th { background: #fafafa; position: sticky; top: 0; }
+    code { background: #f6f6f6; padding: 2px 6px; border-radius: 6px; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; border: 1px solid #ddd; font-size: 0.85rem; color: #444; }
+    .hint { margin-top: 8px; }
+    .hint ul { margin: 6px 0 0 18px; padding: 0; }
+    .hint li { margin: 2px 0; }
+    a { color: inherit; }
+    .small { font-size: 0.9rem; }
+    .statusline { margin-top: 10px; font-size: 0.95rem; }
+  </style>
+</head>
+<body>
+  <h1>ARCS - Amateur Radio Call Search</h1>
+  <div class="muted">
+    A private, self-hosted FCC ULS-backed callbook for trusted use.
+    <br/>
+    This UI queries a local API that returns <strong>HamQTH-compatible XML</strong> for client compatibility.
+  </div>
+
+  <div class="card">
+    <div class="muted small">
+      UI talks to an API base URL defined by <code>UI_API_BASE_URL</code>.
+      Current target: <span class="pill" id="apiBase">...</span>
+    </div>
+
+    <div class="hint muted">
+      <strong>Search rules</strong>
+      <ul>
+        <li>Provide <strong>at least two</strong> fields (name/city/state/zip), <em>or</em> callsign alone (exact match).</li>
+        <li>Callsign supports <code>*</code> wildcard only in multi-field searches (example: <code>K0*</code> with City/State).</li>
+        <li><code>limit=0</code> returns all matches (can be slow).</li>
+      </ul>
+    </div>
+
+    <div class="row" style="margin-top: 10px;">
+      <div>
+        <label for="callsign">Callsign</label>
+        <input id="callsign" placeholder="e.g., N0LJD or K0*" />
+      </div>
+      <div>
+        <label for="name">Name (all words must match)</label>
+        <input id="name" placeholder="e.g., Edward Moss" />
+      </div>
+      <div>
+        <label for="city">City (all words must match)</label>
+        <input id="city" placeholder="e.g., Omaha" />
+      </div>
+      <div>
+        <label for="state">State (2 letters)</label>
+        <input id="state" maxlength="2" placeholder="e.g., NE" />
+      </div>
+      <div>
+        <label for="zip">ZIP (prefix match)</label>
+        <input id="zip" placeholder="e.g., 68114" />
+      </div>
+      <div>
+        <label for="limit">Limit</label>
+        <select id="limit">
+          <option value="100" selected>100 (default)</option>
+          <option value="25">25</option>
+          <option value="200">200</option>
+          <option value="0">0 (all results)</option>
+        </select>
+      </div>
+      <div>
+        <label for="offset">Offset</label>
+        <input id="offset" value="0" readonly />
+      </div>
+    </div>
+
+    <div class="btns">
+      <button id="btnSearch">Search</button>
+      <button class="secondary" id="btnPrev" disabled>Prev</button>
+      <button class="secondary" id="btnNext" disabled>Next</button>
+      <button class="secondary" id="btnClear">Clear</button>
+      <button class="secondary" id="btnOpenXml">Open XML in new tab</button>
+    </div>
+
+    <div id="pageStatus" class="muted statusline"></div>
+    <div id="msg" class="muted" style="margin-top:10px;"></div>
+    <div id="warn" class="warn" style="margin-top:10px;"></div>
+    <div id="err" class="err" style="margin-top:10px;"></div>
+  </div>
+
+  <div class="card">
+    <div class="muted">Results</div>
+    <div style="overflow:auto; max-height: 70vh;">
+      <table>
+        <thead>
+          <tr>
+            <th>Callsign</th>
+            <th>Name</th>
+            <th>Street</th>
+            <th>City</th>
+            <th>State</th>
+            <th>ZIP</th>
+            <th>Status</th>
+            <th>Class</th>
+            <th>Grant</th>
+            <th>Expires</th>
+            <th>XML</th>
+          </tr>
+        </thead>
+        <tbody id="tbody">
+          <tr><td colspan="11" class="muted">No results yet.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <script src="/config.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>
