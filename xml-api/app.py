@@ -1,44 +1,41 @@
 """
 app.py
 ------
-ARCS API (HamQTH-compatible XML) for FCC ULS-backed callbook lookups.
+ARCS API for FCC ULS-backed callbook lookups.
+
+Compatibility notes (for developers)
+------------------------------------
+- This API can emit XML responses in a format compatible with applications that
+  expect HamQTH-style XML envelopes.
+- Session authentication flows are not implemented (compatible-plus approach).
 
 Endpoints
 ---------
 GET /health
-
 GET /xml.php?callsign=<CALLSIGN>[&raw=0|1][&prg=...][&id=...]
-  - Callsign lookup (single best match)
-
 GET /xml.php?action=search&callsign=...&name=...&city=...&state=...&zip=...&limit=...&offset=...
-  - Advanced search (multiple matches)
 
 Design goals
 ------------
-- "Compatible-plus": callsign lookup works without HamQTH session auth.
-- HamQTH-ish envelope: version/xmlns included for compatibility.
-- Search features:
+- Callsign lookup works without session authentication.
+- action=search provides an advanced search subset:
   - substring matching (LIKE %term%)
   - all words must appear (tokens AND'ed)
   - callsign wildcard '*' supported
 - Search guardrails:
-  - default limit=100 (env DEFAULT_SEARCH_LIMIT)
-  - limit=0 means unlimited
-  - require >=2 constraints unless callsign is the only constraint
-- Callsign-only search behavior (practical default):
-  - If callsign has NO wildcard: exact match (callsign = X)
-  - If callsign includes '*': wildcard match (LIKE)
-  - Portable suffix fallback (W1AW/P -> W1AW) only for exact (no wildcard) callsign-only searches
+  - callsign alone is allowed (exact match)
+  - otherwise require >= 2 constraints among callsign, name, city, state, zip
+  - limit defaults to 100 (configurable)
+  - limit=0 means unlimited results (no limit)
 - Safe SQL:
   - all WHERE predicates are parameterized
-  - LIMIT/OFFSET are embedded as integers (MariaDB can reject quoted values there)
+  - LIMIT/OFFSET are embedded as integers because MariaDB rejects quoted values there
 
 Notes
 -----
 - DB access should be READ-ONLY (SELECT on uls.v_callbook).
-- prg/id are accepted and ignored for now (future session auth / telemetry).
+- prg/id are accepted and ignored for now (future telemetry / compatibility).
 """
-
 from __future__ import annotations
 
 import os

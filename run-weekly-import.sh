@@ -13,10 +13,10 @@
 #
 # Typical usage:
 #   Manual:
-#     /opt/hamcall/run-weekly-import.sh
+#     /opt/arcs/run-weekly-import.sh
 #
 #   Cron (example: Fridays at 03:15):
-#     15 3 * * 5 /opt/hamcall/run-weekly-import.sh >> /var/log/uls-import.log 2>&1
+#     15 3 * * 5 /opt/arcs/run-weekly-import.sh >> /var/log/uls-import.log 2>&1
 #
 # High-level flow:
 #   1) Acquire an exclusive lock to prevent concurrent runs
@@ -65,7 +65,7 @@ fi
 # ----------------------------
 
 # Ensure we are in the project directory so docker-compose.yml is found
-cd /opt/hamcall
+cd /opt/arcs
 
 # Run the importer as a one-shot container:
 #   --rm : remove the container after it exits

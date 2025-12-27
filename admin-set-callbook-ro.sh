@@ -25,7 +25,7 @@
 #     /var/lib/mysql. This script is the repeatable admin step for live DBs.
 #
 # Usage:
-#   cd /opt/hamcall
+#   cd /opt/arcs
 #   sudo bash ./admin-set-callbook-ro.sh
 #
 # Optional env overrides:

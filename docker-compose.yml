@@ -1,7 +1,7 @@
 services:
   # ---------------------------------------------------------------------------
-  # Docker Compose for ARCS (Amateur Radio Call Search)
-  # Edward Moss - N0LJD
+  # Docker Compose for ARCS
+  # Amateur Radio Call Search
   # ---------------------------------------------------------------------------
 
   # ---------------------------------------------------------------------------
@@ -9,6 +9,9 @@ services:
   # ---------------------------------------------------------------------------
   uls-mariadb:
     image: mariadb:11
+    container_name: arcs-uls-mariadb
+    user: "0:0"
+
     environment:
       MARIADB_DATABASE: uls
       MARIADB_USER: uls
@@ -19,6 +22,7 @@ services:
     secrets:
       - mariadb_root_password
       - mariadb_user_password
+      - callbook_ro_password
 
     command:
       - --character-set-server=utf8mb4
@@ -30,7 +34,6 @@ services:
 
     volumes:
       - uls_db_data:/var/lib/mysql
-      - ./db-init:/docker-entrypoint-initdb.d:ro
 
     networks:
       - uls_db_net
@@ -52,6 +55,8 @@ services:
   # ---------------------------------------------------------------------------
   uls-importer:
     build: ./importer
+    container_name: arcs-uls-importer
+
     depends_on:
       uls-mariadb:
         condition: service_healthy
@@ -84,6 +89,8 @@ services:
   # ---------------------------------------------------------------------------
   xml-api:
     build: ./xml-api
+    container_name: arcs-xml-api
+
     depends_on:
       uls-mariadb:
         condition: service_healthy
@@ -91,12 +98,17 @@ services:
     environment:
       DB_HOST: uls-mariadb
       DB_NAME: uls
-      DB_USER: callbook_ro
-      DB_PASS_FILE: /run/secrets/callbook_ro_password
-      TZ: America/Chicago
+      DB_USER: uls
+      DB_PASS_FILE: /run/secrets/mariadb_user_password
+
+      # Optional: API version shown in /health
+      ARCS_API_VERSION: "0.1.0"
+
+      # Optional: CORS origin for browser-based debugging; we'll tighten in the next step.
+      # CORS_ALLOW_ORIGIN: "http://192.168.1.121:8081"
 
     secrets:
-      - callbook_ro_password
+      - mariadb_user_password
 
     networks:
       - uls_db_net
@@ -112,20 +124,62 @@ services:
 
 
   # ---------------------------------------------------------------------------
-  # Web UI (nginx static UI + reverse proxy to xml-api)
+  # Web UI (static + reverse-proxy /api -> xml-api)
   # ---------------------------------------------------------------------------
   web-ui:
     build: ./web-ui
+    container_name: arcs-web-ui
+
     environment:
-      # Prefer same-origin proxying via /api in nginx.
-      - UI_API_BASE_URL=/api
+      # UI will default to same-origin "/api" via nginx proxy
+      UI_API_BASE_URL: "/api"
+
     ports:
       - "8081:80"
+
     depends_on:
       - xml-api
 
     networks:
       - uls_ext_net
+
+    restart: unless-stopped
+
+
+  # ---------------------------------------------------------------------------
+  # Smoke Test (one-shot startup verification)
+  #
+  # Purpose:
+  #   Validate the stack is healthy *at startup time* without enabling
+  #   continuous Docker healthchecks (which run forever).
+  #
+  # Usage:
+  #   docker compose up -d --build
+  #   docker compose run --rm arcs-smoketest
+  #
+  # Future:
+  #   If you want continuous monitoring, enable the healthcheck blocks on
+  #   xml-api / web-ui instead of (or in addition to) this.
+  # ---------------------------------------------------------------------------
+  arcs-smoketest:
+    image: alpine:3.20
+    container_name: arcs-smoketest
+    depends_on:
+      - xml-api
+      - web-ui
+    networks:
+      - uls_ext_net
+    entrypoint: ["/bin/sh", "-lc"]
+    command: >
+      apk add --no-cache curl >/dev/null &&
+      echo "[ARCS] Waiting for xml-api..." &&
+      for i in $(seq 1 30); do
+        curl -fsS http://xml-api:8000/health >/dev/null 2>&1 && break
+        sleep 5
+      done &&
+      echo "[ARCS] xml-api health OK" &&
+      echo "[ARCS] Smoke test complete."
+    restart: "no"
 
 
 # ---------------------------------------------------------------------------
