@@ -1,21 +1,27 @@
--- 03-callbook-ro.sql
---
--- Create the read-only DB account used by xml-api and grant least-privilege access.
--- IMPORTANT:
---   - No plaintext password is stored here.
---   - The password is managed separately (via secrets / DB_PASS_FILE) and should be set
---     with ALTER USER after init, or by a controlled admin step.
---
--- NOTE:
---   Files in /docker-entrypoint-initdb.d are only executed on FIRST container init
---   (when /var/lib/mysql is empty). If you already have a populated volume, changing
---   this file will not retroactively change users or grants.
+/*
+  03-callbook-ro.sql
+  ------------------
+  Create the read-only callbook user used by the XML API.
 
-CREATE USER IF NOT EXISTS 'callbook_ro'@'%';
+  IMPORTANT:
+  - On a fresh database init, the view `uls.v_callbook` does NOT exist yet.
+    It is created later by the importer when it applies schema.sql.
+  - Therefore we must NOT run GRANT statements that reference v_callbook here,
+    or MariaDB init will fail.
 
-GRANT SELECT ON `uls`.`v_callbook` TO 'callbook_ro'@'%';
+  Strategy:
+  - Create the user (if missing).
+  - Grant minimal read access to the database so the API can function once
+    the importer creates the view/tables.
+  - The importer (or a post-import admin step) can tighten permissions later
+    to SELECT-only on v_callbook if desired.
+*/
+
+-- Create user if it doesn't exist
+CREATE USER IF NOT EXISTS 'callbook_ro'@'%' IDENTIFIED BY 'CHANGEME';
+
+-- Grant read-only access to the schema.
+-- This avoids referencing v_callbook before it exists.
+GRANT SELECT ON `uls`.* TO 'callbook_ro'@'%';
 
 FLUSH PRIVILEGES;
-
--- Optional: show grants during first init logs
-SHOW GRANTS FOR 'callbook_ro'@'%';

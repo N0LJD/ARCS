@@ -50,7 +50,7 @@ import pymysql
 from fastapi import FastAPI, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 
-APP_TITLE = "ARCS API (HamQTH-compatible XML)"
+APP_TITLE = "ARCS API"
 app = FastAPI(title=APP_TITLE)
 
 # -------------------------------------------------------------------

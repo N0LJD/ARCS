@@ -19,7 +19,7 @@ pass() { echo "? $*"; }
 
 cd "$(dirname "$0")"
 
-echo "== HamCall sanity check =="
+echo "== ARCS sanity check =="
 echo "Project dir: $(pwd)"
 echo "Callsign: $CALLSIGN"
 echo
