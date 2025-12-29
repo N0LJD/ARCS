@@ -3,6 +3,8 @@
 Thumbs.db
 *.swp
 *.swo
+*.bak
+*.tmp
 .vscode/
 .idea/
 
@@ -14,6 +16,7 @@ venv/
 
 # Logs
 *.log
+admin/.bootstrap_complete
 
 # Local env / secrets
 .env
@@ -45,6 +48,3 @@ downloads/
 uls/
 l_amat.zip
 
-# Compose overrides / local resolved configs (optional)
-compose.resolved.yml
-docker-compose.override.yml

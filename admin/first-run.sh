@@ -1,23 +1,28 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# -----------------------------------------------------------------------------
 # admin/first-run.sh
-# ------------------
-# First-run bootstrap for ARCS.
+#
+# Purpose:
+#   Bootstrap ARCS on a fresh install (or perform a controlled warm start).
+#
+# Author: Edward Moss - N0LJD
 #
 # Key rules:
-#   - Warm starts should NOT rewrite secrets if DB volumes are preserved.
 #   - Secrets rotation happens ONLY with --coldstart + (--rotate-secrets or --force).
+#   - Warm starts must NOT rewrite secrets if volumes are preserved.
 #
-# What it does (happy path):
+# High-level flow (happy path):
 #   1) Optional coldstart wipe (down + remove named volumes)
 #   2) Optional secrets rotation (only if coldstart)
 #   3) Start MariaDB only; wait healthy
-#   4) Ensure DB user `xml_api` exists and has SELECT on uls.*
-#   5) Run importer (loads schema + data)
+#   4) Run importer (schema + data + views)
+#   5) Ensure DB user `xml_api` exists with least privilege (SELECT on uls.v_callbook only)
 #   6) Start xml-api + web-ui
-#   7) Crash-loop check (restart-count observation)
-#   8) Sanity curls (timed retry; warnings only)
+#   7) Run canonical sanity checks (admin/sanity-check.sh)
+#   8) Completion information saved in admin/.bootstrap_complete
+# -----------------------------------------------------------------------------
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
@@ -29,49 +34,102 @@ FORCE="no"
 COLDSTART="no"
 ROTATE_SECRETS="no"
 CI="no"
+LOG_SANITY="no"
+STATUS_ONLY="no"
 
-usage() {
-  cat <<'USAGE'
-Usage: ./admin/first-run.sh [--coldstart] [--rotate-secrets] [--force] [--ci]
+# Heartbeat interval seconds (dots).
+HEARTBEAT_INTERVAL="${HEARTBEAT_INTERVAL:-1}"
 
-Default behavior (warm start):
-  - does NOT rotate secrets
-  - starts MariaDB, waits healthy
-  - ensures xml_api DB user permissions
-  - runs importer (schema + data)
-  - starts xml-api + web-ui
-  - verifies containers are not crash-looping
-  - runs timed sanity curls (warnings only)
-
---coldstart:
-  - docker compose down --remove-orphans
-  - removes named volumes arcs_uls_db_data + arcs_uls_cache (wipe DB/cache)
-
---rotate-secrets:
-  - generates new secrets files in ./secrets/
-  - GUARD: only allowed with --coldstart
-
---force:
-  - non-interactive
-  - implies --rotate-secrets
-  - still requires --coldstart to rotate secrets
-
---ci:
-  - non-interactive style output (still runs same bootstrap)
-USAGE
-}
-
-log() { printf '[first-run] %s\n' "$*"; }
+# -----------------------------
+# Logging helpers
+# -----------------------------
+log()  { printf '[first-run] %s\n' "$*"; }
 warn() { printf '[first-run] WARN: %s\n' "$*" >&2; }
-die() { printf '[first-run] ERROR: %s\n' "$*" >&2; exit 2; }
+die()  { printf '[first-run] ERROR: %s\n' "$*" >&2; exit 2; }
 
 need_file() {
   local f="$1"
   [ -f "$f" ] || die "Missing required file: $f"
 }
 
+usage() {
+  # Avoid heredocs here to prevent paste/clipboard issues from corrupting delimiters.
+  printf '%s\n' \
+'Usage: ./admin/first-run.sh [--coldstart] [--rotate-secrets] [--force] [--ci] [--log-sanity] [--status]' \
+'' \
+'Flags:' \
+'  --coldstart        Stop stack and wipe named volumes (fresh install workflow)' \
+'  --rotate-secrets   Generate new local secrets (allowed only with --coldstart)' \
+'  --force            Non-interactive; implies --rotate-secrets (still requires --coldstart)' \
+'  --ci               Non-interactive style output; also enables sanity-check logging' \
+'  --log-sanity       Enable sanity-check logging even when not using --ci' \
+'  --status           Print bootstrap metadata and exit' \
+'' \
+'Env:' \
+'  HEARTBEAT_INTERVAL=1   Seconds between progress dots for long steps'
+}
+
 # -----------------------------
-# Arg parsing (SAFE with no args)
+# Timing helpers (total only)
+# -----------------------------
+SCRIPT_START_EPOCH="$(date +%s)"
+
+fmt_seconds() {
+  local s="$1"
+  local h=$((s / 3600))
+  local m=$(((s % 3600) / 60))
+  local r=$((s % 60))
+  if (( h > 0 )); then
+    printf '%d:%02d:%02d' "$h" "$m" "$r"
+  else
+    printf '%02d:%02d' "$m" "$r"
+  fi
+}
+
+# -----------------------------
+# Heartbeat helpers
+# -----------------------------
+HEARTBEAT_PID=""
+
+start_heartbeat() {
+  # Prints a dot every HEARTBEAT_INTERVAL seconds on the same line.
+  # Used to show the script is still processing.
+  #
+  # In CI mode, we suppress heartbeat dots to keep logs clean.
+  local msg="${1:-Processing}"
+  stop_heartbeat || true
+
+  if [ "${CI:-no}" = "yes" ]; then
+    return 0
+  fi
+
+  printf '[first-run] %s ' "$msg"
+  (
+    while true; do
+      printf '.'
+      sleep "${HEARTBEAT_INTERVAL}"
+    done
+  ) &
+  HEARTBEAT_PID="$!"
+}
+
+stop_heartbeat() {
+  # Stop the heartbeat and ensure subsequent output starts on a fresh line.
+  if [ -n "${HEARTBEAT_PID:-}" ]; then
+    kill "$HEARTBEAT_PID" 2>/dev/null || true
+    wait "$HEARTBEAT_PID" 2>/dev/null || true
+    HEARTBEAT_PID=""
+    printf '\n'
+  fi
+}
+
+cleanup() {
+  stop_heartbeat || true
+}
+trap cleanup EXIT
+
+# -----------------------------
+# Arg parsing
 # -----------------------------
 for arg in "$@"; do
   case "$arg" in
@@ -79,44 +137,104 @@ for arg in "$@"; do
     --coldstart) COLDSTART="yes" ;;
     --rotate-secrets) ROTATE_SECRETS="yes" ;;
     --ci) CI="yes" ;;
+    --log-sanity) LOG_SANITY="yes" ;;
+    --status) STATUS_ONLY="yes" ;;
     -h|--help) usage; exit 0 ;;
-    "") ;; # ignore empty args defensively
+    "") ;;
     *) die "Unknown arg: $arg" ;;
   esac
 done
 
-# Enforce: rotate secrets ONLY on coldstart
+# Guard: rotate secrets ONLY on coldstart
 if [ "$ROTATE_SECRETS" = "yes" ] && [ "$COLDSTART" != "yes" ]; then
   die "Refusing to rotate secrets without --coldstart. Use: ./admin/first-run.sh --coldstart --rotate-secrets (or --force)."
 fi
 
+# ---------------------------------------------------------------------------
+# First-time install convenience:
+# If secrets are missing, assume a brand-new install and:
+#   - enable --coldstart (safe even if nothing exists yet)
+#   - enable --rotate-secrets (generate secrets)
+#
+# This does NOT rotate existing secrets; it only triggers when secrets are absent.
+# ---------------------------------------------------------------------------
+if [ "$COLDSTART" != "yes" ] && [ "$ROTATE_SECRETS" != "yes" ]; then
+  if [ ! -f "$ROOT_DIR/secrets/mariadb_root_password.txt" ] \
+  || [ ! -f "$ROOT_DIR/secrets/mariadb_user_password.txt" ] \
+  || [ ! -f "$ROOT_DIR/secrets/xml_api_password.txt" ]; then
+    log "Secrets not found (first run). Assuming fresh install: enabling --coldstart and generating secrets."
+    COLDSTART="yes"
+    ROTATE_SECRETS="yes"
+  fi
+fi
+
+if [ "$ROTATE_SECRETS" = "yes" ] && [ "$COLDSTART" != "yes" ]; then
+  die "Internal flag state invalid: rotate-secrets requires coldstart."
+fi
+
+# ---------------------------------------------------------------------------
+# Log resolved execution mode (after implicit first-run detection)
+# ---------------------------------------------------------------------------
+
+# A "fresh install" is defined as: no prior successful bootstrap recorded.
+FRESH_INSTALL="no"
+if [ ! -f "$ROOT_DIR/admin/.bootstrap_complete" ]; then
+  FRESH_INSTALL="yes"
+fi
+
+log "Mode resolved: fresh-install=${FRESH_INSTALL} coldstart=${COLDSTART} rotate-secrets=${ROTATE_SECRETS} ci=${CI}"
+
+# Inform the user early if this is a coldstart (fresh install).
+if [ "$COLDSTART" = "yes" ]; then
+  printf '\n[first-run] NOTE: A coldstart (fresh install) may take up to 10 minutes to complete.\n\n'
+fi
+
 # -----------------------------
-# Paths
+# Paths / service names
 # -----------------------------
 SECRETS_DIR="$ROOT_DIR/secrets"
 MDB_ROOT_PW_FILE="$SECRETS_DIR/mariadb_root_password.txt"
-MDB_USER_PW_FILE="$SECRETS_DIR/mariadb_user_password.txt"   # uls
-XML_API_PW_FILE="$SECRETS_DIR/xml_api_password.txt"         # xml_api
+MDB_USER_PW_FILE="$SECRETS_DIR/mariadb_user_password.txt"   # reserved (uls), not directly used here
+XML_API_PW_FILE="$SECRETS_DIR/xml_api_password.txt"
 
-# Compose/service/container names (normalize here)
+# Compose/service/container names
 SVC_DB="uls-mariadb"
 SVC_IMPORTER="uls-importer"
 SVC_API="xml-api"
 SVC_UI="web-ui"
 
+# Container name used by docker inspect for health (matches compose container_name)
 CTR_DB="arcs-uls-mariadb"
-CTR_API="arcs-xml-api"
-CTR_UI="arcs-web-ui"
+
+print_status() {
+  local f="$ROOT_DIR/admin/.bootstrap_complete"
+
+  log "Status requested (--status)."
+  if [ -f "$f" ]; then
+    log "Bootstrap metadata: admin/.bootstrap_complete"
+    sed 's/^/[first-run]   /' "$f"
+  else
+    warn "No bootstrap metadata found at admin/.bootstrap_complete"
+    warn "Run: ./admin/first-run.sh (or ./admin/first-run.sh --coldstart) to perform bootstrap."
+  fi
+}
+
+# Exit early for status mode (no Docker actions)
+if [ "$STATUS_ONLY" = "yes" ]; then
+  print_status
+  exit 0
+fi
 
 # -----------------------------
-# Helpers
+# Core helpers
 # -----------------------------
 random_pw() {
-  # 32 chars, URL-safe-ish
+  # Generate a 32-char password with conservative, URL-safe-ish characters.
   tr -dc 'A-Za-z0-9_@#%+=.,:-' </dev/urandom | head -c 32
 }
 
 rotate_secrets() {
+  # Coldstart-only operation: generate fresh local secrets.
   log "Rotating secrets (coldstart only)..."
   mkdir -p "$SECRETS_DIR"
   umask 077
@@ -133,32 +251,18 @@ rotate_secrets() {
 }
 
 coldstart_wipe() {
+  # Coldstart wipe: stop containers and remove named volumes to force a fresh DB/cache.
   log "Coldstart requested: stopping stack + wiping named volumes..."
   docker compose down --remove-orphans || true
 
-  # Named volumes (match docker-compose.yml names)
   docker volume rm arcs_uls_db_data 2>/dev/null || true
   docker volume rm arcs_uls_cache   2>/dev/null || true
 
   log "Coldstart wipe complete."
 }
 
-container_exists() {
-  local c="$1"
-  docker inspect "$c" >/dev/null 2>&1
-}
-
-restart_count() {
-  local c="$1"
-  docker inspect -f '{{.RestartCount}}' "$c" 2>/dev/null || echo "0"
-}
-
-container_state() {
-  local c="$1"
-  docker inspect -f '{{.State.Status}}' "$c" 2>/dev/null || echo "unknown"
-}
-
 wait_mariadb_healthy() {
+  # Wait until the MariaDB container reports healthy via Docker healthcheck.
   local tries="${1:-90}"
   local delay="${2:-2}"
 
@@ -173,8 +277,40 @@ wait_mariadb_healthy() {
   die "MariaDB did not become healthy in time."
 }
 
+run_importer() {
+  # Importer is the long-running step. We:
+  #   - capture importer output to a logfile
+  #   - show a heartbeat on-screen so users know we're still working
+  #   - on failure, print last lines from the log for fast diagnosis
+  log "Running importer (schema + data + views; this may take a while)..."
+
+  mkdir -p "$ROOT_DIR/logs"
+  local log_file="$ROOT_DIR/logs/importer_$(date +%Y%m%d_%H%M%S).log"
+  log "Importer output: $log_file"
+
+  start_heartbeat "Importer running (still processing)"
+  set +e
+  docker compose run --rm "$SVC_IMPORTER" >"$log_file" 2>&1
+  local rc=$?
+  set -e
+  stop_heartbeat
+
+  # Phase separator: ensures the next log entry is visually distinct after dots.
+  printf '\n'
+
+  if [ "$rc" -ne 0 ]; then
+    log "Importer failed (exit=$rc). Last 50 lines:"
+    tail -n 50 "$log_file" | sed 's/^/[first-run]   /'
+    die "Importer failed. See full log: $log_file"
+  fi
+
+  log "Importer complete."
+  log "Housekeeping..."
+}
+
 ensure_xml_api_user() {
-  # Creates/ensures user exists and has SELECT on uls.*
+  # Enforce least-privilege runtime credentials.
+  # Based on code scan, xml-api reads ONLY from: uls.v_callbook
   need_file "$MDB_ROOT_PW_FILE"
   need_file "$XML_API_PW_FILE"
 
@@ -182,157 +318,126 @@ ensure_xml_api_user() {
   rootpw="$(cat "$MDB_ROOT_PW_FILE")"
   xmlpw="$(cat "$XML_API_PW_FILE")"
 
-  log "Ensuring DB user 'xml_api' exists and password is synchronized..."
+  log "Ensuring DB user 'xml_api' exists, password is synchronized, and privileges are view-only (uls.v_callbook)..."
 
-  # Note: ALTER USER keeps DB aligned with secret file if it ever changes on coldstart.
+  # Create/sync user credentials (idempotent).
   docker compose exec -T "$SVC_DB" \
     mariadb -uroot -p"$rootpw" -e "
       CREATE USER IF NOT EXISTS 'xml_api'@'%' IDENTIFIED BY '${xmlpw}';
       ALTER USER 'xml_api'@'%' IDENTIFIED BY '${xmlpw}';
-      GRANT SELECT ON uls.* TO 'xml_api'@'%';
       FLUSH PRIVILEGES;
     " >/dev/null
 
-  log "DB user 'xml_api' OK."
-}
+  # Enforce least privilege: revoke everything, then grant SELECT only on the view.
+  docker compose exec -T "$SVC_DB" \
+    mariadb -uroot -p"$rootpw" -e "
+      REVOKE ALL PRIVILEGES, GRANT OPTION FROM 'xml_api'@'%';
+      GRANT SELECT ON \`uls\`.\`v_callbook\` TO 'xml_api'@'%';
+      FLUSH PRIVILEGES;
+    " >/dev/null
 
-run_importer() {
-  log "Running importer (this may take a while)..."
-  docker compose run --rm "$SVC_IMPORTER"
-  log "Importer complete."
-}
-
-wait_http_ok() {
-  # wait_http_ok URL tries delay_seconds
-  local url="$1"
-  local tries="${2:-30}"
-  local delay="${3:-1}"
-
-  for _i in $(seq 1 "$tries"); do
-    if curl -fsS --max-time 3 "$url" >/dev/null 2>&1; then
-      return 0
-    fi
-    sleep "$delay"
-  done
-  return 1
-}
-
-curl_sanity() {
-  # curl_sanity LABEL URL tries delay
-  local label="$1"
-  local url="$2"
-  local tries="${3:-25}"
-  local delay="${4:-1}"
-
-  log "Sanity: $label -> $url (tries=$tries delay=${delay}s)"
-  if wait_http_ok "$url" "$tries" "$delay"; then
-    log "Sanity OK: $label"
-  else
-    warn "Sanity FAILED (timed out): $label -> $url"
-  fi
-}
-
-check_crash_loop() {
-  # Observes restart count for a container over a short interval.
-  # If restart count increases, we treat as crash-loop/instability.
-  #
-  # check_crash_loop CONTAINER LABEL seconds poll_interval
-  local c="$1"
-  local label="$2"
-  local seconds="${3:-10}"
-  local poll="${4:-2}"
-
-  if ! container_exists "$c"; then
-    warn "Crash-loop check skipped: container not found: $c ($label)"
-    return 0
+  # Confirm required view exists (import/schema completeness check).
+  if ! docker compose exec -T "$SVC_DB" \
+      mariadb -uroot -p"$rootpw" -N -e "USE \`uls\`; SHOW FULL TABLES LIKE 'v_callbook';" \
+      | grep -qi 'v_callbook'; then
+    die "Required view 'uls.v_callbook' was not found. Import/schema may be incomplete."
   fi
 
-  local state0 rc0 state1 rc1
-  state0="$(container_state "$c")"
-  rc0="$(restart_count "$c")"
-
-  log "Crash-loop check: $label ($c) initial state=$state0 restarts=$rc0; observing ${seconds}s..."
-  local elapsed=0
-  while [ "$elapsed" -lt "$seconds" ]; do
-    sleep "$poll"
-    elapsed=$((elapsed + poll))
-  done
-
-  state1="$(container_state "$c")"
-  rc1="$(restart_count "$c")"
-
-  # If restarts increased during observation, flag it.
-  if [ "$rc1" -gt "$rc0" ]; then
-    warn "Crash-loop suspected: $label ($c) restart count increased ${rc0} -> ${rc1} over ${seconds}s (state now: $state1)"
-    warn "Suggested next step: docker compose logs --tail=200 $SVC_API (and/or $SVC_UI)"
-    return 1
+  # On interactive runs, show grants for transparency.
+  if [ "${CI:-no}" != "yes" ]; then
+    log "xml_api grants now set to:"
+    docker compose exec -T "$SVC_DB" \
+      mariadb -uroot -p"$rootpw" -N -e "SHOW GRANTS FOR 'xml_api'@'%';" \
+      | sed 's/^/[first-run]   /'
   fi
 
-  # If container isn't running, also flag.
-  if [ "$state1" != "running" ]; then
-    warn "Container not running: $label ($c) state=$state1 restarts=$rc1"
-    return 1
-  fi
-
-  log "Crash-loop check OK: $label ($c) state=$state1 restarts=$rc1"
-  return 0
+  log "DB user 'xml_api' OK (restricted to SELECT on uls.v_callbook)."
 }
 
 start_services() {
+  # Bring up the DB first, wait for health, run importer, enforce grants, then start runtime services.
   log "Starting MariaDB..."
   docker compose up -d "$SVC_DB"
 
   wait_mariadb_healthy 90 2
-  ensure_xml_api_user
+
+  # Importer creates schema + views (including v_callbook).
   run_importer
 
-  log "Starting xml-api + web-ui..."
+  # Enforce least privilege AFTER views exist.
+  ensure_xml_api_user
+
+  log "Starting runtime services (xml-api + web-ui)..."
   docker compose up -d "$SVC_API" "$SVC_UI"
 }
 
-post_start_validation() {
-  # Give the services a moment to bind ports before we start observing restarts.
-  sleep 2
+run_sanity_check() {
+  # Execute canonical sanity checks (can be run manually too).
+  local sanity="$ROOT_DIR/admin/sanity-check.sh"
+  local log_flag=""
 
-  # First: wait for API health to become available (this reduces false-positive curl noise)
-  if wait_http_ok "http://127.0.0.1:8080/health" 30 1; then
-    log "API health is responding."
-  else
-    warn "API health did not respond within expected time."
+  if [ "${CI:-no}" = "yes" ] || [ "${LOG_SANITY:-no}" = "yes" ]; then
+    log_flag="--log"
   fi
 
-  # Crash-loop checks (non-fatal, but loud)
-  # - API is the most important (both UI + direct access depend on it)
-  # - UI next (proxy)
-  check_crash_loop "$CTR_API" "xml-api" 12 2 || true
-  check_crash_loop "$CTR_UI"  "web-ui"  12 2 || true
-}
-
-sanity() {
-  log "Sanity checks (timed retries; warnings only):"
-  curl_sanity "API /health"      "http://127.0.0.1:8080/health" 30 1
-  curl_sanity "API XML (W1AW)"   "http://127.0.0.1:8080/xml.php?callsign=W1AW" 30 1
-  curl_sanity "Web UI /api/health" "http://127.0.0.1:8081/api/health" 30 1
+  if [ -x "$sanity" ]; then
+    log "Running sanity checks: admin/sanity-check.sh ${log_flag}"
+    echo
+    "$sanity" W1AW ${log_flag} || die "sanity-check.sh reported failure"
+  else
+    warn "admin/sanity-check.sh not found or not executable; skipping."
+  fi
 }
 
 # -----------------------------
 # Main
 # -----------------------------
+
+# Banner: make logs self-describing and easy to correlate in pasted output.
+log "ARCS first-run starting..."
+log "Project root: $ROOT_DIR"
+
+# Coldstart: stop and wipe state so MariaDB re-initializes cleanly.
 if [ "$COLDSTART" = "yes" ]; then
   coldstart_wipe
 fi
 
+# Secrets:
+# - If rotating (coldstart only), write new secrets.
+# - Otherwise, require existing secrets and be explicit that we're using them.
 if [ "$ROTATE_SECRETS" = "yes" ]; then
   rotate_secrets
 else
-  # Ensure secrets exist for normal operation
   need_file "$MDB_ROOT_PW_FILE"
   need_file "$MDB_USER_PW_FILE"
   need_file "$XML_API_PW_FILE"
+  log "Using existing secrets (no rotation):"
+  log "  $MDB_ROOT_PW_FILE"
+  log "  $MDB_USER_PW_FILE"
+  log "  $XML_API_PW_FILE"
 fi
 
+# Orchestration: DB -> importer -> privilege enforcement -> runtime -> verification.
 start_services
-post_start_validation
-sanity
+run_sanity_check
 
-log "Done."
+TOTAL_END_EPOCH="$(date +%s)"
+TOTAL_ELAPSED=$((TOTAL_END_EPOCH - SCRIPT_START_EPOCH))
+log "Done. Total elapsed $(fmt_seconds "$TOTAL_ELAPSED")."
+
+# ---------------------------------------------------------------------------
+# Record successful bootstrap completion metadata
+# ---------------------------------------------------------------------------
+BOOTSTRAP_MARKER="$ROOT_DIR/admin/.bootstrap_complete"
+
+{
+  echo "bootstrap_completed_at_utc=$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  echo "elapsed_seconds=${TOTAL_ELAPSED}"
+  echo "elapsed_human=$(fmt_seconds "$TOTAL_ELAPSED")"
+  echo "fresh_install=${FRESH_INSTALL:-unknown}"
+  echo "coldstart=${COLDSTART}"
+  echo "rotate_secrets=${ROTATE_SECRETS}"
+  echo "ci_mode=${CI}"
+} > "$BOOTSTRAP_MARKER"
+
+log "Bootstrap metadata written to admin/.bootstrap_complete"

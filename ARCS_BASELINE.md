@@ -174,10 +174,14 @@ Verified workflow:
    ./admin/first-run.sh
 
 3. Verify functionality:
-   http://localhost:8080/health
-   http://localhost:8080/xml.php?callsign=W1AW
-   http://localhost:8081/health.json
-   http://localhost:8081/api/xml.php?callsign=W1AW
+   ./admin/healthcheck.sh
+     - Compose visibility
+     - Check required secrets
+     - DB Root inspection
+     - Inspect SQL xml-api grants
+     - Validate xml_api container
+     - Check API endpoints
+     - Check Web-UI proxy (api/health)
 
 This workflow has been verified repeatedly from empty volumes.
 
@@ -193,36 +197,18 @@ Current baseline:
 - No TLS termination
 
 Planned future enhancements:
-- Read-only database user
 - External reverse proxy
 - TLS
 - Rate limiting
 - IP filtering
+- Add RO users
 
 These are explicitly out of scope for the v1.0.0 baseline.
 
 ======================================================================
 
-8. QA AND VALIDATION STATUS
 
-A modular QA automation script was developed during v1.0 work to validate:
-- Container readiness
-- Health endpoints
-- XML correctness
-- Database sanity
-
-Outcome:
-- Functional checks validated system correctness
-- Tooling complexity and file-permission edge cases produced false negatives
-- QA automation is NOT considered authoritative for the v1.0.0 baseline
-
-Baseline policy:
-- Manual smoke checks define system health
-- Automation may be reintroduced post-hardening
-
-======================================================================
-
-9. DEVELOPMENT PHILOSOPHY
+8. DEVELOPMENT PHILOSOPHY
 
 - Favor clarity over cleverness
 - Prefer explicit operational steps over brittle automation
@@ -232,7 +218,7 @@ Baseline policy:
 
 ======================================================================
 
-10. USING THIS DOCUMENT WITH CHATGPT
+9. USING THIS DOCUMENT WITH CHATGPT
 
 To start a new ChatGPT conversation about ARCS:
 
@@ -246,7 +232,7 @@ This avoids re-explaining architecture, design decisions, and constraints.
 
 ======================================================================
 
-11. REPOSITORY REFERENCE
+10. REPOSITORY REFERENCE
 
 Canonical source of truth:
 https://github.com/N0LJD/ARCS

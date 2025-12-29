@@ -100,32 +100,46 @@ It is intentionally conservative and explicit.
 ### API Health
 
 curl -sS http://127.0.0.1:8080/health
+- Expected output:
+    {"ok":true,"service":"ARCS API"}
 
-Expected output:
+---
 
-{"ok":true,"service":"ARCS API"}
+## Bootstrap Metadata and Status
+
+After a successful `admin/first-run.sh` run, ARCS writes a bootstrap metadata file:
+- `admin/.bootstrap_complete`
+
+This file records:
+- `bootstrap_completed_at_utc` (timestamp)
+- `elapsed_seconds` / `elapsed_human`
+- `coldstart`, `rotate_secrets`, `ci_mode` (resolved execution mode)
+
+This file is intended to be human-readable today and future-extensible (additional fields may be added later).
+
+### View Bootstrap Status
+
+To print the recorded bootstrap metadata:
+
+```bash
+./admin/first-run.sh --status
 
 ---
 
 ### XML Callsign Query (HamQTH-compatible)
 
 curl -sS "http://127.0.0.1:8080/xml.php?callsign=W1AW" | head -n 20
-
-You should see valid XML data returned.
+  - You should see valid XML data returned.
 
 ---
 
 ### Web UI Proxy Check
 
 curl -sS http://127.0.0.1:8081/api/health
-
-Expected output:
-
-{"ok":true,"service":"ARCS API"}
-
-The Web UI is available at:
-
-http://127.0.0.1:8081
+  - Expected output:
+    {"ok":true,"service":"ARCS API"}
+  - The Web UI is available at:
+    http://127.0.0.1:8081
 
 ---
 
