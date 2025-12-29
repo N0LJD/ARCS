@@ -1,7 +1,26 @@
 services:
   # ---------------------------------------------------------------------------
   # Docker Compose for ARCS
-  # Amateur Radio Call Search
+  # Amateur Radio Call Service
+  # ---------------------------------------------------------------------------
+  #
+  # NOTE ON STARTUP ORDER (IMPORTANT):
+  # - The importer needs a write-capable DB user ("uls") to apply schema and load data.
+  # - The public XML API should use a read-only DB user ("xml_api") for least privilege.
+  #
+  # Because "xml_api" is created/granted AFTER the database is initialized/imported,
+  # a fully automatic "docker compose up -d" can race: xml-api may start before the
+  # read-only user exists.
+  #
+  # For now, admin/first-run.sh handles the safe sequence:
+  #   1) Start MariaDB
+  #   2) Run importer
+  #   3) Create/grant xml_api (read-only)
+  #   4) Start xml-api + web-ui
+  #
+  # FUTURE (optional):
+  # - Add an xml-api "wait wrapper" entrypoint that waits for db auth to succeed,
+  #   enabling single-command bring-up without sequencing.
   # ---------------------------------------------------------------------------
 
   # ---------------------------------------------------------------------------
@@ -10,7 +29,6 @@ services:
   uls-mariadb:
     image: mariadb:11
     container_name: arcs-uls-mariadb
-    user: "0:0"
 
     environment:
       MARIADB_DATABASE: uls
@@ -22,7 +40,6 @@ services:
     secrets:
       - mariadb_root_password
       - mariadb_user_password
-      - callbook_ro_password
 
     command:
       - --character-set-server=utf8mb4
@@ -34,10 +51,13 @@ services:
 
     volumes:
       - uls_db_data:/var/lib/mysql
+      - ./db-init:/docker-entrypoint-initdb.d:ro
 
     networks:
       - uls_db_net
 
+    # Healthcheck runs continuously. If you later prefer "only at startup",
+    # you can disable it and use a one-shot wait script instead.
     healthcheck:
       test:
         - CMD-SHELL
@@ -52,6 +72,7 @@ services:
 
   # ---------------------------------------------------------------------------
   # Importer (one-shot job container)
+  # - Uses the write-capable "uls" DB account.
   # ---------------------------------------------------------------------------
   uls-importer:
     build: ./importer
@@ -86,6 +107,8 @@ services:
 
   # ---------------------------------------------------------------------------
   # XML API (public query service)
+  # - Uses read-only DB user: "xml_api"
+  # - Password is provided via docker secret "xml_api_password"
   # ---------------------------------------------------------------------------
   xml-api:
     build: ./xml-api
@@ -98,17 +121,18 @@ services:
     environment:
       DB_HOST: uls-mariadb
       DB_NAME: uls
-      DB_USER: uls
-      DB_PASS_FILE: /run/secrets/mariadb_user_password
+      DB_USER: xml_api
+      DB_PASS_FILE: /run/secrets/xml_api_password
+      TZ: America/Chicago
 
       # Optional: API version shown in /health
-      ARCS_API_VERSION: "0.1.0"
+      ARCS_API_VERSION: "1.0.0"
 
-      # Optional: CORS origin for browser-based debugging; we'll tighten in the next step.
-      # CORS_ALLOW_ORIGIN: "http://192.168.1.121:8081"
+      # Optional: tighten CORS for browser debugging; keep unset for server-to-server usage.
+      # CORS_ALLOW_ORIGIN: "http://127.0.0.1:8081"
 
     secrets:
-      - mariadb_user_password
+      - xml_api_password
 
     networks:
       - uls_db_net
@@ -133,6 +157,7 @@ services:
     environment:
       # UI will default to same-origin "/api" via nginx proxy
       UI_API_BASE_URL: "/api"
+      ARCS_UI_VERSION: ${ARCS_UI_VERSION:-dev}
 
     ports:
       - "8081:80"
@@ -144,42 +169,6 @@ services:
       - uls_ext_net
 
     restart: unless-stopped
-
-
-  # ---------------------------------------------------------------------------
-  # Smoke Test (one-shot startup verification)
-  #
-  # Purpose:
-  #   Validate the stack is healthy *at startup time* without enabling
-  #   continuous Docker healthchecks (which run forever).
-  #
-  # Usage:
-  #   docker compose up -d --build
-  #   docker compose run --rm arcs-smoketest
-  #
-  # Future:
-  #   If you want continuous monitoring, enable the healthcheck blocks on
-  #   xml-api / web-ui instead of (or in addition to) this.
-  # ---------------------------------------------------------------------------
-  arcs-smoketest:
-    image: alpine:3.20
-    container_name: arcs-smoketest
-    depends_on:
-      - xml-api
-      - web-ui
-    networks:
-      - uls_ext_net
-    entrypoint: ["/bin/sh", "-lc"]
-    command: >
-      apk add --no-cache curl >/dev/null &&
-      echo "[ARCS] Waiting for xml-api..." &&
-      for i in $(seq 1 30); do
-        curl -fsS http://xml-api:8000/health >/dev/null 2>&1 && break
-        sleep 5
-      done &&
-      echo "[ARCS] xml-api health OK" &&
-      echo "[ARCS] Smoke test complete."
-    restart: "no"
 
 
 # ---------------------------------------------------------------------------
@@ -214,5 +203,6 @@ secrets:
   mariadb_user_password:
     file: ./secrets/mariadb_user_password.txt
 
-  callbook_ro_password:
-    file: ./secrets/callbook_ro_password.txt
+  # Password used by the read-only MariaDB user "xml_api" (used by the xml-api service)
+  xml_api_password:
+    file: ./secrets/xml_api_password.txt

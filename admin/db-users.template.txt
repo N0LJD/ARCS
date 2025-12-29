@@ -1,0 +1,21 @@
+# db-users.template.txt
+# ---------------------
+# Copy to db-users.txt and edit.
+#
+# Format: account,password,priv
+#
+# priv values:
+#   r = read-only       (SELECT)
+#   w = read/write      (SELECT, INSERT, UPDATE, DELETE)
+#   a = admin on schema (ALL PRIVILEGES on DB)
+#
+# Lines beginning with # are comments.
+# Blank lines are ignored.
+#
+# Example:
+# xml_api,public,r
+# admin_user,S0m3Str0ngPass!,a
+#
+# IMPORTANT:
+# The schema/header line must be commented so scripts don't treat it as a real account:
+# account,password,priv

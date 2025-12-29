@@ -1,0 +1,8 @@
+# db-users.txt
+# Lines beginning with # are comments.
+#
+# Format: account,password,priv
+# priv: r=read-only, w=read/write, a=admin
+#
+# account,password,priv
+xml_api,public,r

@@ -47,8 +47,29 @@ import pymysql
 from fastapi import FastAPI, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 
+# -------------------------------------------------------------------
+# Application metadata
+# -------------------------------------------------------------------
+
 APP_TITLE = "ARCS API"
-app = FastAPI(title=APP_TITLE)
+ARCS_API_VERSION = os.getenv("ARCS_API_VERSION", "dev")
+
+app = FastAPI(
+    title=APP_TITLE,
+    version=ARCS_API_VERSION,
+)
+
+# -------------------------------------------------------------------
+# Health endpoint (used by QA and monitoring)
+# -------------------------------------------------------------------
+
+@app.get("/health")
+def health() -> Dict[str, object]:
+    return {
+        "ok": True,
+        "service": APP_TITLE,
+        "version": ARCS_API_VERSION,
+    }
 
 # -------------------------------------------------------------------
 # CORS (Browser access)
@@ -222,9 +243,13 @@ def _portable_base(callsign: str) -> str:
 # Endpoints
 # ----------------------------
 @app.get("/health")
-def health():
-    return {"ok": True, "service": APP_TITLE}
-
+def health() -> Dict[str, object]:
+    # Stable contract for QA/monitoring
+    return {
+        "ok": True,
+        "service": APP_TITLE,
+        "version": ARCS_API_VERSION,
+    }
 
 @app.get(
     "/xml.php",
