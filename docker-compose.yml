@@ -75,7 +75,7 @@ services:
   # - Uses the write-capable "uls" DB account.
   # ---------------------------------------------------------------------------
   uls-importer:
-    build: ./importer
+    image: ghcr.io/n0ljd/arcs-uls-importer:v1.0.0-baseline
     container_name: arcs-uls-importer
 
     depends_on:
@@ -111,7 +111,7 @@ services:
   # - Password is provided via docker secret "xml_api_password"
   # ---------------------------------------------------------------------------
   xml-api:
-    build: ./xml-api
+    image: ghcr.io/n0ljd/arcs-xml-api:v1.0.0-baseline
     container_name: arcs-xml-api
 
     depends_on:
@@ -151,7 +151,7 @@ services:
   # Web UI (static + reverse-proxy /api -> xml-api)
   # ---------------------------------------------------------------------------
   web-ui:
-    build: ./web-ui
+    image: ghcr.io/n0ljd/arcs-web-ui:v1.0.0-baseline
     container_name: arcs-web-ui
 
     environment:
