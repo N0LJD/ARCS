@@ -1,184 +1,106 @@
-ARCS – Amateur Radio Call Service
+# ARCS – Amateur Radio Call Search
+# Edward Moss - N0LJD
 
-ARCS (Amateur Radio Call Service) is a self-hosted, Docker-based application that provides a local FCC ULS callsign database, a HamQTH-compatible XML API, and a lightweight web interface for convenience and testing.
+---
 
-ARCS is designed for read-only public query access, clear separation of responsibilities, and predictable, auditable operation.
+ARCS (Amateur Radio Call Search) is a self-hosted, containerized amateur radio
+callbook service that provides FCC ULS license lookup data through a
+HamQTH-compatible XML API.
 
-This project is not affiliated with HamQTH, HamCall, Buckmaster International LLC, or the FCC. It is an independent, open-source educational and community project.
+The project is designed to be simple, transparent, and educational while
+remaining interoperable with amateur radio software that expects the HamQTH
+XML API format.
 
--------------------------------------------------------------------------------
+---
 
-WHY THIS PROJECT EXISTS
+## What ARCS Provides
 
-ARCS exists as a practical learning and integration project.
+- A **HamQTH-compatible XML API** for amateur radio callsign lookups
+- Uses **official FCC ULS amateur license data**
+- Fully **self-hosted** using Docker and docker-compose
+- Optional **Web UI** for basic lookups
+- Clear separation between API, database, importer, and UI components
 
-It brings together Linux system administration, Docker container orchestration, MariaDB schema design and bulk data ingestion, API development using FastAPI, secure credential handling, and layered application architecture.
+Once deployed, ARCS does not rely on external callbook services.
 
-Amateur Radio provides the real-world data and motivation that ties these components together.
+---
 
--------------------------------------------------------------------------------
+## Why This Project Exists
 
-HIGH-LEVEL ARCHITECTURE
+Personally, I wanted to learn more about Linux, Docker, SQL, Python, scripting,
+and APIs. This project also explores security concepts by separating a
+front-end web server, an application layer, and a back-end database.
 
-ARCS is intentionally split into distinct services, each with a clearly defined role.
+Amateur Radio serves as the catalyst for bringing these components together
+into a practical, real-world system.
 
-Web UI (nginx)
-  |
-  | /api
-  v
-XML API (FastAPI, read-only)
-  |
-  | SELECT queries only
-  v
-MariaDB (FCC ULS data)
-  ^
-  |
-Importer (one-shot, write access)
+---
 
--------------------------------------------------------------------------------
+## High-Level Architecture
 
-CONTAINERS AND RESPONSIBILITIES
+ARCS consists of four Docker services:
 
-MariaDB (uls-mariadb)
-- Persistent database container
-- Stores FCC ULS data
-- Initialized once and reused
-- No externally exposed ports
+- **arcs-uls-mariadb**  
+  MariaDB database containing FCC ULS data
 
-Importer (uls-importer)
-- One-shot job container
-- Downloads FCC ULS data
-- Applies schema
-- Loads and merges tables
-- Uses a write-capable database account
-- Not exposed externally
+- **arcs-uls-importer**  
+  One-shot job that downloads and loads FCC ULS data
 
-XML API (xml-api)
-- Public-facing service
-- HamQTH-compatible XML responses
-- Uses read-only database credentials
-- Intended for callbook and logging applications
+- **arcs-xml-api**  
+  FastAPI-based HamQTH-compatible XML API
 
-Web UI (web-ui)
-- Convenience interface
-- Proxies /api requests to xml-api
-- Optional; the API can be used independently
+- **arcs-web-ui**  
+  nginx-based static Web UI and reverse proxy
 
--------------------------------------------------------------------------------
+The database runs on an internal Docker network and is never exposed externally.
 
-DATABASE SECURITY MODEL
+---
 
-ARCS enforces least-privilege access by design.
+## Documentation Overview
 
-Purpose            Database User   Privileges
-Schema and import  uls             Write
-Public XML API     xml_api         Read-only
+- **README.md**  
+  Project overview (this file)
 
-Important points:
-- The XML API never uses write-capable credentials
-- Import credentials are never exposed publicly
-- Database users are managed explicitly by admin scripts
-- Credentials are provided via Docker secrets only
+- **QUICKSTART.md**  
+  Minimal, verified steps to bring ARCS online
 
--------------------------------------------------------------------------------
+- **readme-tech.txt**  
+  Technical deep dive into containers, design decisions, and internals
 
-SECRETS HANDLING
+- **ARCS_BASELINE.md**  
+  Canonical baseline reference used for long-term consistency and AI context
 
-Secrets are not stored in images or source code.
+---
 
-They are created locally in the secrets directory:
+## Non-Affiliation Disclaimer
 
-secrets/mariadb_root_password.txt
-secrets/mariadb_user_password.txt
-secrets/xml_api_password.txt
+ARCS is **not affiliated with**: HamQTH, HamCall, or Buckmaster International.
+This project implements a compatible API format strictly for interoperability.
 
-These files are generated by admin/first-run.sh, mounted into containers as Docker secrets, and read at runtime only.
+---
 
--------------------------------------------------------------------------------
+## License & Data
 
-STARTUP PHILOSOPHY
+- **Code License:** MIT License
+- **Data Source:** FCC ULS amateur license data (public domain)
 
-ARCS favors explicit, documented sequencing over hidden automation.
+ARCS does not redistribute FCC data outside the running system and does not
+claim ownership of FCC ULS data.
 
-For a fresh install:
-1. The database is started
-2. The importer loads schema and data
-3. Read-only database users are created
-4. Public services are started
+---
 
-This avoids race conditions and makes failures obvious and debuggable.
+## Reference Test Environment
 
-A future XML API wait wrapper may allow fully automatic startup, but this is intentionally deferred and documented rather than implicit.
+Validated using:
 
--------------------------------------------------------------------------------
+- Ubuntu Server 24.04
+- 4 GB RAM
+- 20 GB storage
+- Virtual machine under Proxmox VE 9.1.4
+- Host: Intel NUC8i5 with 32 GB RAM and 256 GB storage
 
-QUICKSTART
+---
 
-See QUICKSTART.md for a complete, step-by-step setup guide.
-
-The Quickstart covers:
-- First-run initialization
-- Importing FCC data
-- Verifying the API and Web UI
-- Managing database users
-- Restarting services
-
--------------------------------------------------------------------------------
-
-API COMPATIBILITY
-
-The XML API is compatible with the HamQTH XML API specification.
-
-Example query:
-
-http://localhost:8080/xml.php?callsign=W1AW
-
-Responses are returned as XML and suitable for logging applications, callbook lookups, and amateur radio utilities.
-
--------------------------------------------------------------------------------
-
-MANAGING DATABASE USERS (ADVANCED)
-
-Database accounts are defined in admin/db-users.txt.
-
-Format:
-
-# account,password,priv
-xml_api,public,r
-
-Apply changes with:
-
-./admin/apply-db-users.sh
-
-Preview changes safely with:
-
-./admin/apply-db-users.sh --dry-run
-
--------------------------------------------------------------------------------
-
-PROJECT STATUS
-
-ARCS is stable, self-contained, and suitable for personal or community hosting. It is designed for transparency, education, and predictable operation.
-
-Planned future enhancements may include optional reverse-proxy hardening, an optional startup wait wrapper, and expanded documentation.
-
--------------------------------------------------------------------------------
-
-LICENSE AND DISCLAIMER
-
-This project is provided as-is, without warranty.
-
-ARCS is not affiliated with the FCC, HamQTH, HamCall, or Buckmaster. It does not redistribute proprietary callbook data and uses publicly available FCC ULS data only.
-
-Use responsibly and in accordance with applicable laws and amateur radio regulations.
-
--------------------------------------------------------------------------------
-
-FINAL NOTES
-
-ARCS is intentionally conservative in automation, explicit in operation, and clear in security boundaries.
-
-If you can read the scripts, you can understand exactly what the system is doing.
-
-That is by design.
+For setup instructions, see **QUICKSTART.md**.  
+For architectural and internal details, see **readme-tech.txt**.
 
