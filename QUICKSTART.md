@@ -1,94 +1,142 @@
-# ARCS Quick Start
-# Edward Moss - N0LJD
+# ARCS Quick Start Guide
 
-This document describes the single supported method to bring ARCS online
-from a clean system using the automated bootstrap process.
+This document explains how to bring ARCS online for the first time and how
+ongoing operation works once the system is established.
 
-This is not an operator manual. Its purpose is to get a functional system
-running quickly, predictably, and in a known-good baseline state.
+ARCS is designed so that the same command can be run safely on both a new
+system and an existing system.
 
 ---
 
 ## Prerequisites
 
-- Linux host
-- Docker and docker-compose installed
-- Internet access (required to download FCC ULS data)
-- Approximately 20 GB of free disk space
+Before starting, ensure the following are installed:
 
-The reference system used for validation is documented in README.md.
+- Linux-based operating system
+- Docker
+- Docker Compose (v2)
+- Internet access (for FCC data download)
 
 ---
 
-## First-Time Startup
+## Initial Installation (New System)
 
-ARCS provides an automated bootstrap script that performs all required setup
-steps in the correct order. This includes:
-
-- Generating Docker secrets
-- Starting required containers
-- Downloading FCC ULS data
-- Initializing and populating the database
-- Bringing the XML API and Web UI online
-
-From the project root directory, run:
+From the project root directory:
 
 ./admin/first-run.sh
 
----
+### What happens during the first run
 
-## Expected Runtime
+When executed on a fresh system with no prior state, first-run.sh will:
 
-Initial startup typically takes approximately 10 minutes, depending on
-network speed and disk performance.
+1. Detect that required secrets do not exist
+2. Generate local secret files under ./secrets
+3. Start the MariaDB container and wait for it to become healthy
+4. Run the ULS importer, which:
+   - Downloads the FCC ULS Amateur Radio dataset
+   - Applies database schema
+   - Imports license and entity data
+   - Builds the callbook view
+5. Create and enforce a least-privilege database user for the API
+6. Start the XML API and Web UI services
+7. Run sanity checks to verify correct operation
+8. Record bootstrap and importer metadata
 
-This script is safe to re-run and is the authoritative bootstrap mechanism
-for the v1.0.0 baseline.
-
----
-
-## System Health Verification
-
-After the bootstrap process completes, verify system health by running:
-
-./admin/sanity-check.sh
-
-This script performs basic validation checks, including:
-
-- Docker container status
-- Presence of required secrets
-- Database availability
-- XML API responsiveness
-- Web UI reverse proxy functionality
-
-A clean run indicates the system is operating as expected.
+No manual configuration is required for a standard installation.
 
 ---
 
-## XML API Test Example
+## Normal Operation (Existing System)
 
-The XML API is compatible with the HamQTH API format and is case-insensitive
-for callsign queries.
+Once ARCS is installed, the same command is used for maintenance:
 
-Example using curl:
+./admin/first-run.sh
 
-curl "http://localhost:8080/xml.php?callsign=W1AW"
+### What happens on subsequent runs
 
-A successful response returns an XML document containing callsign data.
+On an existing system, first-run.sh behaves as a reconciliation and update
+process:
+
+- Existing secrets are preserved
+- Docker volumes are not removed
+- Services are started if stopped
+- Database schema and views are ensured
+- The importer runs in safe mode:
+  - Acquires a database-level lock
+  - Checks FCC source metadata
+  - Automatically skips the import if the FCC data is unchanged
+  - Downloads and applies updates only when new data is available
+
+If no FCC updates are detected, the script performs a no-op import and exits
+cleanly without modifying the database.
+
+Because of this behavior, first-run.sh may be safely scheduled (for example,
+via a weekly cron job) to check for FCC updates.
 
 ---
 
-## Web UI Access
+## Checking System Status
 
-If the Web UI container is enabled, open a browser and navigate to:
+To inspect system state without modifying anything:
 
-http://localhost:8081/
+./admin/first-run.sh --status
 
-The Web UI is provided as a convenience interface and is not required for
-API-based integrations.
+This prints a concise summary including:
+
+- Last bootstrap result
+- Last importer run result
+- Whether the last import was skipped or applied
+- Relevant timestamps and source metadata
 
 ---
 
-For architectural details, design decisions, and internal behavior, see
-readme-tech.txt.
+## Forcing a Full Reset
 
+If a complete rebuild is required:
+
+./admin/first-run.sh --coldstart --rotate-secrets
+
+This will:
+
+- Stop all running services
+- Remove named Docker volumes
+- Regenerate secrets
+- Perform a full database reinitialization and import
+
+This operation is destructive and should be used deliberately.
+
+---
+
+## Accessing the Services
+
+Once running:
+
+XML API  
+- Primary interface for applications
+- Port and endpoint defined by your Docker configuration
+
+Web UI  
+- Optional, human-facing interface
+- Provided for convenience only
+
+Refer to README.md for example URLs.
+
+---
+
+## Operational Notes
+
+- Running first-run.sh multiple times is expected and safe
+- Imports are skipped automatically when no FCC data changes are detected
+- All significant actions are recorded in logs/arcs-state.json
+- Legacy bootstrap metadata is also written to admin/.bootstrap_complete
+
+---
+
+## Summary
+
+- One command (first-run.sh) is used for install, update, and reconciliation
+- New systems are initialized automatically
+- Existing systems are updated only when necessary
+- Explicit flags are required for destructive operations
+
+This design supports unattended operation and long-term self-hosting.

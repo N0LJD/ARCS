@@ -73,6 +73,8 @@ services:
   # ---------------------------------------------------------------------------
   # Importer (one-shot job container)
   # - Uses the write-capable "uls" DB account.
+  # - Writes canonical importer metadata to /logs/arcs-state.json
+  #   (bind-mounted from host ./logs).
   # ---------------------------------------------------------------------------
   uls-importer:
     image: ghcr.io/n0ljd/arcs-uls-importer:v1.0.0-baseline
@@ -90,6 +92,9 @@ services:
       DATA_DIR: /data
       TZ: America/Chicago
 
+      # Canonical ARCS state file (inside container). Host binds ./logs -> /logs.
+      ARCS_STATE_PATH: /logs/arcs-state.json
+
     secrets:
       - mariadb_user_password
 
@@ -97,6 +102,9 @@ services:
       - uls_cache:/data
       - ./importer/schema.sql:/app/schema.sql:ro
       - ./importer/import_uls.py:/app/import_uls.py:ro
+
+      # Canonical state + operational artifacts
+      - ./logs:/logs
 
     networks:
       - uls_db_net

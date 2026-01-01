@@ -1,106 +1,142 @@
-# ARCS – Amateur Radio Call Search
-# Edward Moss - N0LJD
+# ARCS â€” Amateur Radio Call Service
 
----
+ARCS (Amateur Radio Call Service) is a self-hosted, containerized amateur radio
+callbook service that provides FCC ULS license data via a HamQTH-compatible XML
+API format for interoperability.
 
-ARCS (Amateur Radio Call Search) is a self-hosted, containerized amateur radio
-callbook service that provides FCC ULS license lookup data through a
-HamQTH-compatible XML API.
+This project is intended for operators who want a local, inspectable, and
+self-managed callbook service built directly from official FCC data.
 
-The project is designed to be simple, transparent, and educational while
-remaining interoperable with amateur radio software that expects the HamQTH
-XML API format.
-
----
-
-## What ARCS Provides
-
-- A **HamQTH-compatible XML API** for amateur radio callsign lookups
-- Uses **official FCC ULS amateur license data**
-- Fully **self-hosted** using Docker and docker-compose
-- Optional **Web UI** for basic lookups
-- Clear separation between API, database, importer, and UI components
-
-Once deployed, ARCS does not rely on external callbook services.
+ARCS is NOT affiliated with HamQTH, HamCall, or Buckmaster.
+It implements a compatible API format strictly for interoperability.
 
 ---
 
 ## Why This Project Exists
 
-Personally, I wanted to learn more about Linux, Docker, SQL, Python, scripting,
-and APIs. This project also explores security concepts by separating a
-front-end web server, an application layer, and a back-end database.
+ARCS exists as both a practical service and a learning reference.
 
-Amateur Radio serves as the catalyst for bringing these components together
-into a practical, real-world system.
+It brings together:
+- Docker and Docker Compose
+- Linux service orchestration
+- Python-based import and API services
+- Database-backed applications
+- Real-world amateur radio licensing data
 
----
+The emphasis is on clarity, reproducibility, operational safety, and local control.
 
-## High-Level Architecture
-
-ARCS consists of four Docker services:
-
-- **arcs-uls-mariadb**  
-  MariaDB database containing FCC ULS data
-
-- **arcs-uls-importer**  
-  One-shot job that downloads and loads FCC ULS data
-
-- **arcs-xml-api**  
-  FastAPI-based HamQTH-compatible XML API
-
-- **arcs-web-ui**  
-  nginx-based static Web UI and reverse proxy
-
-The database runs on an internal Docker network and is never exposed externally.
+ARCS is designed so that running the same operational command repeatedly
+reconciles system state rather than rebuilding it.
 
 ---
 
-## Documentation Overview
+## Requirements
 
-- **README.md**  
-  Project overview (this file)
-
-- **QUICKSTART.md**  
-  Minimal, verified steps to bring ARCS online
-
-- **readme-tech.txt**  
-  Technical deep dive into containers, design decisions, and internals
-
-- **ARCS_BASELINE.md**  
-  Canonical baseline reference used for long-term consistency and AI context
+- Linux-based operating system
+- Docker
+- Docker Compose (v2)
 
 ---
 
-## Non-Affiliation Disclaimer
+## Quick Setup
 
-ARCS is **not affiliated with**: HamQTH, HamCall, or Buckmaster International.
-This project implements a compatible API format strictly for interoperability.
+### 1. Download the project
 
----
+git clone https://github.com/N0LJD/ARCS arcs
 
-## License & Data
+Assumption: the project will live in /opt/arcs
 
-- **Code License:** MIT License
-- **Data Source:** FCC ULS amateur license data (public domain)
-
-ARCS does not redistribute FCC data outside the running system and does not
-claim ownership of FCC ULS data.
+mv arcs /opt/arcs
+cd /opt/arcs
 
 ---
 
-## Reference Test Environment
+### 2. Run the bootstrap script
 
-Validated using:
+./admin/first-run.sh
 
-- Ubuntu Server 24.04
-- 4 GB RAM
-- 20 GB storage
-- Virtual machine under Proxmox VE 9.1.4
-- Host: Intel NUC8i5 with 32 GB RAM and 256 GB storage
+#### First execution (new system)
+
+When run on a fresh checkout, first-run.sh will:
+
+- Generate required local secrets
+- Start the MariaDB database
+- Download and import FCC ULS data
+- Create database schema and callbook views
+- Configure least-privilege database users
+- Start the XML API and Web UI services
+- Record system state and metadata
+
+No manual setup steps are required.
+
+#### Subsequent executions (existing system)
+
+Running the same command again is safe and expected.
+
+On an existing system, first-run.sh will:
+
+- Preserve existing secrets and database volumes
+- Ensure required services are running
+- Check whether FCC data has changed
+- Automatically skip the import if the FCC data is unchanged
+- Download and apply updates only when new FCC data is available
+
+If no updates are required, the script completes quickly without modifying
+the database.
+
+This makes first-run.sh suitable for repeated execution, automation,
+and unattended operation.
 
 ---
 
-For setup instructions, see **QUICKSTART.md**.  
-For architectural and internal details, see **readme-tech.txt**.
+## Scheduled Updates (Optional)
 
+Because first-run.sh is idempotent and safe to re-run, it can be scheduled.
+
+Example weekly cron job (runs every Sunday at 03:15):
+
+15 3 * * 0 cd /opt/arcs && ./admin/first-run.sh >> logs/cron.log 2>&1
+
+This will:
+- Check for updated FCC data
+- Apply updates only if the source has changed
+- Leave the system untouched otherwise
+
+---
+
+## Accessing ARCS
+
+### XML API (primary interface)
+
+Port: 8080  
+Example:
+http://<host-ip>:8080/xml.php?callsign=W1AW
+
+### Web UI (convenience only)
+
+Port: 8081  
+Example:
+http://<host-ip>:8081
+
+The Web UI is optional and provided only as a convenience.
+API clients should use the XML API directly.
+
+---
+
+## Documentation
+
+QUICKSTART.md  
+Operational guide covering install, updates, status checks, and recovery.
+
+readme-tech.md  
+Technical reference describing architecture, state management, importer
+locking, metadata, and design philosophy.
+
+---
+
+## Repository
+
+Canonical source of truth:
+https://github.com/N0LJD/ARCS
+
+Current documentation version: v1.0.1
