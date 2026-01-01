@@ -6,7 +6,7 @@ set -euo pipefail
 #
 # Purpose:
 #   Canonical health verification for ARCS. This is designed to be:
-#     - called automatically at the end of admin/first-run.sh
+#     - called automatically at the end of admin/arcsctl.sh
 #     - run manually by operators for quick validation
 #
 # What it checks:
@@ -21,7 +21,7 @@ set -euo pipefail
 #   6) Web UI proxy check (/api/health)
 #
 # Output:
-#   - Uses a consistent "[sanity]" prefix to match first-run.sh log style
+#   - Uses a consistent "[sanity]" prefix to match arcsctl.sh log style
 #   - PASS/WARN/FAIL counts summarized at the end
 #
 # Options:
@@ -138,7 +138,7 @@ if [[ -f "$BOOTSTRAP_FILE" ]]; then
   [[ -n "$COLDSTART_META" ]] && log "  coldstart=$COLDSTART_META"
   [[ -n "$ROTATE_META" ]] && log "  rotate_secrets=$ROTATE_META"
 else
-  warn "Bootstrap metadata file not found. This is expected if first-run.sh has not completed successfully yet."
+  warn "Bootstrap metadata file not found. This is expected if arcsctl.sh has not completed successfully yet."
 fi
 echo
 

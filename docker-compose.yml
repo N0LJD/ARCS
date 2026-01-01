@@ -12,7 +12,7 @@ services:
   # a fully automatic "docker compose up -d" can race: xml-api may start before the
   # read-only user exists.
   #
-  # For now, admin/first-run.sh handles the safe sequence:
+  # For now, admin/arcsctl.sh handles the safe sequence:
   #   1) Start MariaDB
   #   2) Run importer
   #   3) Create/grant xml_api (read-only)

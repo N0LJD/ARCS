@@ -4,30 +4,32 @@ This document provides a detailed technical overview of ARCS for operators,
 developers, and learners who want to understand how the system works and why
 it was designed this way.
 
-Documentation version: v1.0.1
+Current version line: v1.0.x
 
 ---
 
-## 0. Design Philosophy
+## Philosophy (Why It Looks Like This)
 
-ARCS is built around a simple operational rule:
+ARCS is intentionally opinionated toward **clarity over cleverness**.
 
-The same command should be safe to run repeatedly and should converge the
-system toward the desired state.
+The system is designed to be:
+- Readable by humans
+- Safe to re-run without surprises
+- Observable through explicit state files
+- Educational for operators learning Docker, Linux, and data pipelines
 
-The system favors:
-- Idempotence
-- Explicit state recording
-- Conservative defaults
-- Clear failure modes
+Rather than splitting responsibilities across many scripts, ARCS converges
+bootstrap, reconciliation, and update logic into a single control path.
+This reduces ambiguity and makes operational behavior predictable.
 
-Destructive operations are never implicit.
+Amateur radio data is used as a real-world integration problem, not merely
+as an application payload.
 
 ---
 
 ## 1. System Architecture
 
-ARCS consists of containerized services orchestrated via Docker Compose.
+ARCS is composed of containerized services orchestrated via Docker Compose.
 
 Web Browser
     |
@@ -35,11 +37,11 @@ Web Browser
     v
 arcs-web-ui (nginx)
     - Static UI
-    - Reverse proxy to XML API
+    - Reverse proxy /api/* → arcs-xml-api
     |
-    | HTTP
+    | HTTP /api/*
     v
-arcs-xml-api (FastAPI)
+arcs-xml-api (FastAPI + Uvicorn)
     - HamQTH-compatible XML API
     |
     | TCP 3306
@@ -47,7 +49,7 @@ arcs-xml-api (FastAPI)
 arcs-uls-mariadb (MariaDB, latest)
     - FCC ULS database
 
-A one-shot importer container handles FCC data ingestion and updates.
+A one-shot importer container is used to load and update FCC data.
 
 ---
 
@@ -56,12 +58,16 @@ A one-shot importer container handles FCC data ingestion and updates.
 ### arcs-uls-mariadb
 
 - Image: mariadb:latest
-- Persistent database stored in Docker volume
+- Persistent FCC ULS database
+- Data stored in Docker volume uls_db_data
 - Healthcheck gates dependent services
 
-Constraints:
+Important constraints:
 - MariaDB init scripts cannot consume Docker secrets
-- Additional users are created post-start
+- Additional users must be created after startup
+
+Design consequence:
+- Bootstrap script performs post-start privilege enforcement
 
 ---
 
@@ -72,21 +78,25 @@ Constraints:
 - Converts legacy encodings to UTF-8
 - Loads staging tables
 - Merges into final schema
-- Creates v_callbook view
+- Creates and updates v_callbook view
+- Safe to re-run
+- Skips work automatically when source data is unchanged
 
-Safety features:
-- Database-level named lock prevents concurrent imports
-- Source metadata comparison prevents unnecessary imports
-- Import is skipped when data is unchanged
+Importer state is written to:
+- logs/arcs-state.json (canonical)
+- logs/.last_import (human-readable snapshot)
 
 ---
 
 ### arcs-xml-api
 
-- FastAPI-based service
-- Read-only API
-- HamQTH-compatible XML output
+- FastAPI application
+- Public HamQTH-compatible XML API
+- Endpoints:
+  - /health
+  - /xml.php
 - Public port: 8080
+- API version injected via environment
 
 ---
 
@@ -94,7 +104,8 @@ Safety features:
 
 - nginx-based static UI
 - Reverse proxy to API
-- Optional convenience interface
+- Public port: 8081
+- Convenience only; not required for API usage
 
 ---
 
@@ -102,55 +113,62 @@ Safety features:
 
 Two Docker networks are used:
 
-uls_db_net:
+### uls_db_net (internal)
 - MariaDB
 - API
 - Importer
-- Internal only
+- Not externally accessible
 
-uls_ext_net:
+### uls_ext_net
 - API
 - Web UI
-- Exposed to host
+- Exposed via mapped ports
 
-The database is never directly exposed.
+This ensures the database is never directly exposed.
 
 ---
 
 ## 4. Secrets Management
 
-Secrets are stored locally and mounted via Docker secrets.
+Docker secrets are used for:
+- MariaDB root password
+- MariaDB application password
+- XML API database password
 
-Design constraints:
-- Secrets are root-owned
-- MariaDB init cannot read secrets
-- User creation occurs post-start
+Constraints:
+- Secrets are mounted as root:root
+- MariaDB init runs as mysql
+- Init scripts cannot read secrets
 
-Secret rotation is explicit and never automatic.
+Design resolution:
+- Secrets are generated and managed by arcsctl.sh
+- Database users are created and enforced post-start
+
+Secrets are rotated only when explicitly requested.
 
 ---
 
-## 5. Bootstrap and State Reconciliation
+## 5. Control Script (arcsctl.sh)
 
-Authoritative entry point:
+Authoritative control mechanism:
 
-admin/first-run.sh
+admin/arcsctl.sh
 
 Responsibilities:
-- Detect new vs existing systems
-- Optionally rotate secrets
-- Start database
-- Run importer safely
-- Enforce DB permissions
-- Start runtime services
-- Record system state
+- Optional coldstart (volume wipe)
+- Optional secrets rotation
+- Start MariaDB and wait for health
+- Run importer (with skip-if-unchanged default)
+- Enforce least-privilege DB users
+- Start API and UI services
+- Run sanity checks
+- Record canonical state
 
-first-run.sh is not a one-time installer.
-It is a reconciliation tool.
+Behavior is idempotent and safe to re-run.
 
 ---
 
-## 6. System State Model
+## 6. State and Metadata
 
 Canonical system state is recorded in:
 
@@ -160,63 +178,45 @@ Namespaces include:
 - bootstrap
 - uls_import
 
-Recorded data includes:
-- Execution timestamps
-- Import results
-- Skip reasons
-- Source metadata (ETag, ZIP hash, ZIP size)
-- Local data update timestamps
+Importer metadata includes:
+- Source URL
+- HTTP ETag and Last-Modified
+- ZIP checksum and byte size
+- Import start and finish times
+- Skip reasons when applicable
+- Timestamp of last local data update
 
-Legacy text metadata is written to admin/.bootstrap_complete for compatibility.
-
----
-
-## 7. Importer State Machine (Conceptual)
-
-Importer execution follows this flow:
-
-START
- → Acquire DB lock
- → Load previous importer state
- → Fetch HTTP metadata
- → Compare source metadata
- → If unchanged:
-      → Record skip
-      → Release lock
-      → EXIT
- → Else:
-      → Download ZIP
-      → Verify hash and size
-      → Import data
-      → Update views
-      → Record metadata
- → Release lock
- → EXIT
-
-This ensures correctness, safety, and auditability.
+This file is authoritative for operational status.
 
 ---
 
-## 8. Security Posture (Baseline)
+## 7. Security Posture (Baseline)
 
-Baseline intentionally includes:
+The v1.x baseline intentionally includes:
+- Public API
 - No authentication
 - No TLS
 - No rate limiting
 
-This keeps the system transparent and inspectable.
+This is a deliberate choice to keep the system simple and inspectable.
 
-Hardening is expected to be handled externally.
+Planned future enhancements may include:
+- External reverse proxy
+- TLS termination
+- Rate limiting
+- IP filtering
+- Authentication layers
+
+These are explicitly out of scope for the baseline release.
 
 ---
 
-## 9. Summary
+## 8. Design Principles Summary
 
-- Safe-by-default operations
-- Explicit destructive flags
-- Canonical state tracking
-- Clear separation of concerns
-- Designed for long-term unattended operation
+- Prefer explicit control paths
+- Make state visible and inspectable
+- Avoid hidden automation
+- Treat re-runs as normal operation
+- Keep learning value high
+- Use amateur radio as a real integration domain
 
-ARCS uses amateur radio data as a real-world integration problem while remaining
-approachable for operators and learners.

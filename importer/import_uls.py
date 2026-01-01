@@ -57,7 +57,7 @@ Features (cron/CI friendly)
 Back-compat / legacy
 --------------------
 This file also writes to admin/.bootstrap_complete (KEY=VALUE) for now because
-first-run.sh historically reports status from there. We'll update first-run.sh
+arcsctl.sh historically reports status from there. We'll update arcsctl.sh
 --status after this change to use logs/arcs-state.json as the canonical source.
 
 Exit codes
@@ -105,7 +105,7 @@ STATE_NAMESPACE = "uls_import"
 # Optional lightweight marker (human-friendly; not required for logic)
 LAST_IMPORT_PATH = pathlib.Path(os.environ.get("ARCS_LAST_IMPORT_PATH", "/logs/.last_import"))
 
-# Legacy bootstrap metadata file (kept for now; first-run.sh will be updated later)
+# Legacy bootstrap metadata file (kept for now; arcsctl.sh will be updated later)
 BOOTSTRAP_META_PATH_DEFAULT = pathlib.Path(
     os.environ.get("ARCS_BOOTSTRAP_META_PATH", "/opt/arcs/admin/.bootstrap_complete")
 )

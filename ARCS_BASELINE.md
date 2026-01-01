@@ -1,33 +1,65 @@
-# ARCS � ChatGPT Baseline Context
+# ARCS — AI / ChatGPT Baseline Context
 Amateur Radio Call Service (ARCS)
-Repository: https://github.com/N0LJD/ARCS
-Baseline: main branch (published, stable)
-Baseline Version: v1.0.0 (frozen)
+
+Repository (canonical):
+https://github.com/N0LJD/ARCS
+
+Baseline branch:
+main
+
+Baseline reference version:
+v1.0.x (operational baseline, evolving)
 
 ======================================================================
 
 1. PROJECT OVERVIEW
 
 ARCS (Amateur Radio Call Service) is a self-hosted, containerized amateur
-radio callbook service that provides FCC ULS license lookup data using a
+radio callbook service that provides FCC ULS amateur license data via a
 HamQTH-compatible XML API.
 
-The project is designed to:
-- Be fully self-contained and self-hosted
-- Use official FCC ULS amateur license data
-- Provide a public XML API compatible with HamQTH clients
-- Offer a simple web UI as a convenience tool
-- Serve as a learning and reference project for Docker, Linux, Python,
-  APIs, and database-backed services
+The project is intentionally designed to:
 
-ARCS is NOT affiliated with HamQTH, HamCall, or Buckmaster. It implements
-a compatible API format for interoperability only.
+- Be fully self-hosted and locally inspectable
+- Use official FCC ULS amateur license data (l_amat.zip)
+- Provide a public XML API compatible with HamQTH clients
+- Support standard HamQTH XML Callbook Search queries
+- Offer a simple web UI as a convenience (non-authoritative)
+- Serve as a practical learning and reference project for:
+  - Docker / Docker Compose
+  - Linux service orchestration
+  - Python APIs
+  - SQL-backed data pipelines
+  - Operational state tracking
+
+ARCS is NOT affiliated with HamQTH, HamCall, or Buckmaster.
+It implements a compatible XML response format strictly for interoperability.
 
 ======================================================================
 
-2. ARCHITECTURE SUMMARY
+2. XML CALLBOOK COMPATIBILITY (IMPORTANT)
 
-ARCS consists of four Docker services orchestrated via docker-compose:
+ARCS implements the HamQTH XML Callbook Search API format as documented at:
+
+https://www.hamqth.com/developers.php
+
+Specifically:
+- XML-based callsign lookup
+- HamQTH-compatible response structure
+- Intended to work with existing HamQTH-capable logging software
+
+Typical query example:
+
+http://<host>:8080/xml.php?callsign=W1AW
+
+The ARCS XML API should be evaluated and reasoned about using the HamQTH
+developer documentation as the authoritative protocol reference.
+
+======================================================================
+
+3. ARCHITECTURE SUMMARY
+
+ARCS consists of containerized services orchestrated via Docker Compose.
 
 Web Browser
     |
@@ -35,7 +67,7 @@ Web Browser
     v
 arcs-web-ui (nginx)
     - Static web UI
-    - Reverse proxy /api/* ? arcs-xml-api
+    - Reverse proxy /api/* → arcs-xml-api
     |
     | HTTP /api/*
     v
@@ -44,119 +76,116 @@ arcs-xml-api (FastAPI + Uvicorn)
     |
     | TCP 3306
     v
-arcs-uls-mariadb (MariaDB 11)
+arcs-uls-mariadb (MariaDB, latest)
     - FCC ULS database
 
 One-shot job container:
 arcs-uls-importer
-    - Downloads and loads FCC ULS data
+    - Downloads and imports FCC ULS data
 
 ======================================================================
 
-3. CONTAINERS AND RESPONSIBILITIES
+4. CONTAINERS AND RESPONSIBILITIES
 
-3.1 arcs-uls-mariadb
-- Image: mariadb:11
+4.1 arcs-uls-mariadb
+- Image: mariadb:latest
 - Persistent database storing FCC ULS amateur license data
-- Initialized using:
-  - MARIADB_DATABASE=uls
-  - MARIADB_USER=uls
-  - MARIADB_PASSWORD_FILE
+- Database: uls
 - Uses Docker secrets for credentials
 - Data persisted via Docker volume (uls_db_data)
-- Healthcheck ensures readiness before dependent services start
+- Healthcheck gates dependent services
 
-Important design decision:
-- MariaDB init scripts do NOT read Docker secrets
-- Additional DB users are created post-startup via admin scripts
+Important design constraint:
+- MariaDB init scripts cannot consume Docker secrets
+- Additional DB users must be created post-startup
 
 ---------------------------------------------------------------------
 
-3.2 arcs-uls-importer
+4.2 arcs-uls-importer
 - One-shot job container
 - Downloads FCC ULS l_amat.zip
 - Converts legacy encodings to UTF-8
 - Loads staging tables
 - Merges data into final schema
-- Creates v_callbook view used by the API
+- Creates and maintains v_callbook view
 - Safe to re-run
-- Exits cleanly when complete
+- Skips work automatically if source data is unchanged
+
+Importer metadata is recorded in:
+- logs/arcs-state.json (canonical)
+- logs/.last_import (human-readable snapshot)
 
 ---------------------------------------------------------------------
 
-3.3 arcs-xml-api
+4.3 arcs-xml-api
 - FastAPI application
 - Public HamQTH-compatible XML API
 - Endpoints:
   - /health
   - /xml.php
-- Uses the bootstrap database account (uls) in the baseline
+- Uses least-privilege DB credentials
 - Publicly exposed on port 8080
-- Designed to support future read-only DB users
 
 Versioning:
-- API version is injected via ARCS_API_VERSION
+- API version injected via environment
 - /health returns structured JSON including version
 
 ---------------------------------------------------------------------
 
-3.4 arcs-web-ui
+4.4 arcs-web-ui
 - nginx-based static web interface
-- Provides:
-  - Simple callbook lookup form
-  - Reverse proxy /api/* ? arcs-xml-api
+- Simple callbook lookup form
+- Reverse proxy /api/* → arcs-xml-api
 - Exposed on port 8081
-- Convenience interface only; not required for API clients
-
-Versioning:
-- UI version is injected via ARCS_UI_VERSION
-- /health.json returns structured JSON including version
+- Convenience interface only
 
 ======================================================================
 
-4. NETWORKING MODEL
+5. NETWORKING MODEL
 
 Two Docker networks are used:
 
 uls_db_net (internal)
-- Used by MariaDB, API, and importer
+- MariaDB
+- API
+- Importer
 - Not externally accessible
 
 uls_ext_net
-- Used by API and web UI
-- API exposed publicly via mapped ports
+- API
+- Web UI
+- Exposed via mapped ports
 
 This ensures:
-- Database is never exposed externally
-- Only API and UI are reachable from outside Docker
+- The database is never directly exposed
+- Only API and UI are reachable externally
 
 ======================================================================
 
-5. SECRETS MANAGEMENT
+6. SECRETS MANAGEMENT
 
 Docker secrets are used for:
 - MariaDB root password
-- MariaDB application user password
+- MariaDB application password
 - XML API database password
 
 Important constraints:
-- Docker secrets are mounted root:root
+- Secrets are mounted root:root
 - MariaDB init scripts run as mysql
 - Init scripts cannot consume Docker secrets
 
 Resulting design:
-- Database bootstrap uses the standard MariaDB application user
-- Additional users (e.g. read-only, API-specific) are created after startup
-  using explicit admin scripts
+- Secrets are generated and managed by the control script
+- Database users and privileges are enforced post-start
 
-This is intentional and documented.
+Secrets are rotated ONLY when explicitly requested.
 
 ======================================================================
 
-6. VERIFIED BASELINE STARTUP WORKFLOW (FROM SCRATCH)
+7. VERIFIED BASELINE WORKFLOW (FROM SCRATCH)
 
-Authoritative bootstrap mechanism:
-- admin/first-run.sh
+Authoritative control mechanism:
+admin/arcsctl.sh
 
 Cold start definition:
 - Containers stopped
@@ -166,77 +195,73 @@ Cold start definition:
 
 Verified workflow:
 
-1. Optional teardown (cold start):
+1. Optional teardown:
    docker compose down --remove-orphans
    docker volume rm arcs_uls_db_data arcs_uls_cache
 
-2. Run bootstrap:
-   ./admin/first-run.sh
+2. Bootstrap / reconcile:
+   ./admin/arcsctl.sh
 
-3. Verify functionality:
-   ./admin/healthcheck.sh
-     - Compose visibility
-     - Check required secrets
-     - DB Root inspection
-     - Inspect SQL xml-api grants
-     - Validate xml_api container
-     - Check API endpoints
-     - Check Web-UI proxy (api/health)
+3. Status inspection:
+   ./admin/arcsctl.sh --status
 
-This workflow has been verified repeatedly from empty volumes.
+Canonical operational state is recorded in:
+logs/arcs-state.json
 
 ======================================================================
 
-7. SECURITY POSTURE (BASELINE)
+8. SECURITY POSTURE (BASELINE)
 
 Current baseline:
-- Public API
-- Database accessed using application account
+- Public XML API
 - No authentication
-- No rate limiting
 - No TLS termination
+- No rate limiting
+- Database protected by Docker networking
 
-Planned future enhancements:
+Planned future enhancements (out of scope for v1.0.x baseline):
 - External reverse proxy
 - TLS
 - Rate limiting
 - IP filtering
-- Add RO users
-
-These are explicitly out of scope for the v1.0.0 baseline.
+- Additional read-only DB users
 
 ======================================================================
 
-
-8. DEVELOPMENT PHILOSOPHY
+9. DESIGN PHILOSOPHY
 
 - Favor clarity over cleverness
-- Prefer explicit operational steps over brittle automation
-- Document tradeoffs clearly
-- Keep the system understandable for users new to Docker
-- Use amateur radio as the real-world integration context
+- Prefer explicit control paths over hidden automation
+- Treat re-runs as normal operation
+- Make state visible and inspectable
+- Keep the system approachable for Docker learners
+- Use amateur radio as a real-world integration context
 
 ======================================================================
 
-9. USING THIS DOCUMENT WITH CHATGPT
+10. USING THIS DOCUMENT WITH AI SYSTEMS (ChatGPT)
 
-To start a new ChatGPT conversation about ARCS:
+When starting a new AI-assisted discussion about ARCS:
 
-Provide this file and say:
+Provide this file and state:
 
-"Use this document as the baseline context for the ARCS project.
-Assume the repository is in the published v1.0.0 baseline state unless
-otherwise noted."
+"Use ARCS_BASELINE.md as the authoritative baseline context.
+Assume the repository state matches the main branch of
+https://github.com/N0LJD/ARCS unless otherwise specified."
 
-This avoids re-explaining architecture, design decisions, and constraints.
+This avoids re-explaining architecture, tradeoffs, and constraints.
 
 ======================================================================
 
-10. REPOSITORY REFERENCE
+11. REPOSITORY REFERENCE
 
 Canonical source of truth:
 https://github.com/N0LJD/ARCS
 
-Branch: main
-Tag: v1.0.0-baseline
+Primary documentation:
+- README.md
+- QUICKSTART.md
+- readme-tech.md
 
+Branch: main
+Version line: v1.0.x

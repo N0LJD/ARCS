@@ -1,142 +1,133 @@
-# ARCS Quick Start Guide
+# ARCS — Quick Start Guide
 
-This document explains how to bring ARCS online for the first time and how
-ongoing operation works once the system is established.
+This document provides a concise operational guide for installing, updating,
+and maintaining ARCS using the unified control script.
 
-ARCS is designed so that the same command can be run safely on both a new
-system and an existing system.
+If you are new to the project, start here.
 
 ---
 
 ## Prerequisites
 
-Before starting, ensure the following are installed:
-
-- Linux-based operating system
+- Linux host
 - Docker
-- Docker Compose (v2)
-- Internet access (for FCC data download)
+- Docker Compose
+- Internet access (to retrieve FCC ULS data)
 
 ---
 
 ## Initial Installation (New System)
 
-From the project root directory:
+1. Clone the repository and place it in the expected location:
 
-./admin/first-run.sh
+git clone https://github.com/N0LJD/ARCS arcs
+mv arcs /opt/arcs
+cd /opt/arcs
 
-### What happens during the first run
+2. Run the control script:
 
-When executed on a fresh system with no prior state, first-run.sh will:
+./admin/arcsctl.sh
 
-1. Detect that required secrets do not exist
-2. Generate local secret files under ./secrets
-3. Start the MariaDB container and wait for it to become healthy
-4. Run the ULS importer, which:
-   - Downloads the FCC ULS Amateur Radio dataset
-   - Applies database schema
-   - Imports license and entity data
-   - Builds the callbook view
-5. Create and enforce a least-privilege database user for the API
-6. Start the XML API and Web UI services
-7. Run sanity checks to verify correct operation
-8. Record bootstrap and importer metadata
+On a system with no prior state, this will:
 
-No manual configuration is required for a standard installation.
+- Generate all required secrets
+- Initialize the MariaDB database
+- Download the FCC ULS l_amat.zip dataset
+- Import and normalize license data
+- Create database views used by the API
+- Start the XML API and Web UI
+- Record canonical system state in logs/arcs-state.json
+
+No additional commands are required.
 
 ---
 
 ## Normal Operation (Existing System)
 
-Once ARCS is installed, the same command is used for maintenance:
+On an already-initialized system, running the same command:
 
-./admin/first-run.sh
+./admin/arcsctl.sh
 
-### What happens on subsequent runs
+will act as a **reconciliation and update pass**:
 
-On an existing system, first-run.sh behaves as a reconciliation and update
-process:
+- Ensures MariaDB is running and healthy
+- Checks FCC metadata (ETag / Last-Modified)
+- Skips the import if the source data is unchanged
+- Downloads and applies new data if available
+- Reconciles database permissions
+- Ensures API and UI services are running
 
-- Existing secrets are preserved
-- Docker volumes are not removed
-- Services are started if stopped
-- Database schema and views are ensured
-- The importer runs in safe mode:
-  - Acquires a database-level lock
-  - Checks FCC source metadata
-  - Automatically skips the import if the FCC data is unchanged
-  - Downloads and applies updates only when new data is available
-
-If no FCC updates are detected, the script performs a no-op import and exits
-cleanly without modifying the database.
-
-Because of this behavior, first-run.sh may be safely scheduled (for example,
-via a weekly cron job) to check for FCC updates.
+This behavior is intentional and safe.
+Running the script multiple times is expected.
 
 ---
 
 ## Checking System Status
 
-To inspect system state without modifying anything:
+To view the current operational state without making changes:
 
-./admin/first-run.sh --status
+./admin/arcsctl.sh --status
 
 This prints a concise summary including:
 
-- Last bootstrap result
-- Last importer run result
-- Whether the last import was skipped or applied
-- Relevant timestamps and source metadata
+- Last successful bootstrap
+- Last importer run or skip reason
+- FCC source metadata (checksum, size, ETag)
+- Timestamp of last local data update
+
+Canonical state is stored in:
+
+logs/arcs-state.json
 
 ---
 
-## Forcing a Full Reset
+## Rebuilding the System (Cold Start)
 
-If a complete rebuild is required:
+To perform a full rebuild:
 
-./admin/first-run.sh --coldstart --rotate-secrets
+./admin/arcsctl.sh --coldstart --rotate-secrets
 
 This will:
 
-- Stop all running services
-- Remove named Docker volumes
-- Regenerate secrets
-- Perform a full database reinitialization and import
+- Stop all containers
+- Remove named volumes (database and cache)
+- Generate new secrets
+- Reinitialize the database from scratch
+- Re-import FCC data
+- Restart all services
 
-This operation is destructive and should be used deliberately.
-
----
-
-## Accessing the Services
-
-Once running:
-
-XML API  
-- Primary interface for applications
-- Port and endpoint defined by your Docker configuration
-
-Web UI  
-- Optional, human-facing interface
-- Provided for convenience only
-
-Refer to README.md for example URLs.
+This is destructive and intended for rebuilds only.
 
 ---
 
-## Operational Notes
+## Non-Interactive / CI Mode
 
-- Running first-run.sh multiple times is expected and safe
-- Imports are skipped automatically when no FCC data changes are detected
-- All significant actions are recorded in logs/arcs-state.json
-- Legacy bootstrap metadata is also written to admin/.bootstrap_complete
+For scripted or CI-style execution:
+
+./admin/arcsctl.sh --ci
+
+This suppresses interactive output and enables additional logging.
 
 ---
 
-## Summary
+## Scheduling (Optional)
 
-- One command (first-run.sh) is used for install, update, and reconciliation
-- New systems are initialized automatically
-- Existing systems are updated only when necessary
-- Explicit flags are required for destructive operations
+Because the control script is idempotent, it may be safely scheduled.
+For example, a weekly check for FCC updates:
 
-This design supports unattended operation and long-term self-hosting.
+15 3 * * 0 cd /opt/arcs && ./admin/arcsctl.sh >> logs/cron.log 2>&1
+
+---
+
+## Key Operational Notes
+
+- There is no separate “weekly import” script
+- One command handles install, update, and reconciliation
+- Import is skipped automatically when FCC data is unchanged
+- All authoritative state is recorded in logs/arcs-state.json
+
+---
+
+For architectural details and design rationale, see:
+
+readme-tech.md
