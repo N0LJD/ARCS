@@ -41,7 +41,9 @@ convenience or opaque automation.
 ### 1. Download the project
 
 git clone https://github.com/N0LJD/ARCS arcs
+
 mv arcs /opt/arcs
+
 cd /opt/arcs
 
 ---
