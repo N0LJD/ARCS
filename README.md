@@ -6,8 +6,8 @@ callbook service that provides FCC ULS license data via a HamQTH-compatible XML 
 This project is intended for operators who want a **local, inspectable, and
 self-managed** callbook service built from official FCC data.
 
-ARCS is **NOT affiliated** with HamQTH, HamCall, or Buckmaster.
-It implements a compatible API format strictly for interoperability.
+ARCS is **NOT affiliated** with HamQTH. It implements a compatible API format 
+strictly for interoperability.
 
 ---
 
