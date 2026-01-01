@@ -15,6 +15,7 @@ __pycache__/
 venv/
 
 # Logs
+logs/
 *.log
 admin/.bootstrap_complete
 
@@ -48,4 +49,3 @@ downloads/
 uls/
 l_amat.zip
 
-logs/
