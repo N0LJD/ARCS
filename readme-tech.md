@@ -10,20 +10,20 @@ Current version line: v1.0.x
 
 ## Philosophy (Why It Looks Like This)
 
-ARCS is intentionally opinionated toward **clarity over cleverness**.
+ARCS is intentionally opinionated toward clarity over cleverness.
 
 The system is designed to be:
+
 - Readable by humans
 - Safe to re-run without surprises
 - Observable through explicit state files
 - Educational for operators learning Docker, Linux, and data pipelines
 
-Rather than splitting responsibilities across many scripts, ARCS converges
-bootstrap, reconciliation, and update logic into a single control path.
-This reduces ambiguity and makes operational behavior predictable.
+Rather than distributing responsibilities across multiple ad-hoc scripts,
+ARCS converges bootstrap, reconciliation, and update logic into a single
+authoritative control path.
 
-Amateur radio data is used as a real-world integration problem, not merely
-as an application payload.
+Re-runs are treated as normal operation, not exceptional cases.
 
 ---
 
@@ -46,7 +46,7 @@ arcs-xml-api (FastAPI + Uvicorn)
     |
     | TCP 3306
     v
-arcs-uls-mariadb (MariaDB, latest)
+arcs-uls-mariadb (MariaDB)
     - FCC ULS database
 
 A one-shot importer container is used to load and update FCC data.
@@ -59,15 +59,14 @@ A one-shot importer container is used to load and update FCC data.
 
 - Image: mariadb:latest
 - Persistent FCC ULS database
-- Data stored in Docker volume uls_db_data
+- Data stored in Docker volume: uls_db_data
 - Healthcheck gates dependent services
 
-Important constraints:
+Important constraint:
 - MariaDB init scripts cannot consume Docker secrets
-- Additional users must be created after startup
 
 Design consequence:
-- Bootstrap script performs post-start privilege enforcement
+- Database users and privileges are enforced post-start by arcsctl.sh
 
 ---
 
@@ -78,25 +77,34 @@ Design consequence:
 - Converts legacy encodings to UTF-8
 - Loads staging tables
 - Merges into final schema
-- Creates and updates v_callbook view
+- Updates v_callbook view
 - Safe to re-run
-- Skips work automatically when source data is unchanged
+- Automatically skips work when source data is unchanged
+
+Importer behavior is controlled by:
+
+- HTTP ETag / Last-Modified headers
+- ZIP SHA-256 checksum fallback
+- DB-level named lock to prevent overlapping runs
 
 Importer state is written to:
+
 - logs/arcs-state.json (canonical)
 - logs/.last_import (human-readable snapshot)
+
+All legacy metadata paths have been removed.
 
 ---
 
 ### arcs-xml-api
 
 - FastAPI application
-- Public HamQTH-compatible XML API
+- HamQTH-compatible XML API
 - Endpoints:
   - /health
   - /xml.php
 - Public port: 8080
-- API version injected via environment
+- API version injected via environment variables
 
 ---
 
@@ -105,7 +113,7 @@ Importer state is written to:
 - nginx-based static UI
 - Reverse proxy to API
 - Public port: 8081
-- Convenience only; not required for API usage
+- Convenience interface only
 
 ---
 
@@ -114,37 +122,42 @@ Importer state is written to:
 Two Docker networks are used:
 
 ### uls_db_net (internal)
+
 - MariaDB
 - API
 - Importer
 - Not externally accessible
 
 ### uls_ext_net
+
 - API
 - Web UI
 - Exposed via mapped ports
 
-This ensures the database is never directly exposed.
+This prevents direct database exposure.
 
 ---
 
 ## 4. Secrets Management
 
 Docker secrets are used for:
+
 - MariaDB root password
 - MariaDB application password
 - XML API database password
 
 Constraints:
+
 - Secrets are mounted as root:root
 - MariaDB init runs as mysql
 - Init scripts cannot read secrets
 
-Design resolution:
-- Secrets are generated and managed by arcsctl.sh
-- Database users are created and enforced post-start
+Resolution:
 
-Secrets are rotated only when explicitly requested.
+- Secrets are generated and managed by arcsctl.sh
+- Database users and privileges are enforced after startup
+- Secrets rotate only on explicit request
+  (using --coldstart --rotate-secrets)
 
 ---
 
@@ -155,63 +168,93 @@ Authoritative control mechanism:
 admin/arcsctl.sh
 
 Responsibilities:
+
 - Optional coldstart (volume wipe)
 - Optional secrets rotation
 - Start MariaDB and wait for health
-- Run importer (with skip-if-unchanged default)
+- Run importer with skip-if-unchanged enabled
 - Enforce least-privilege DB users
 - Start API and UI services
 - Run sanity checks
-- Record canonical state
+- Record canonical system state
+- Manage optional cron-based automation
 
-Behavior is idempotent and safe to re-run.
+The script is idempotent and safe to run manually or unattended.
 
 ---
 
-## 6. State and Metadata
+## 6. Automatic Reconciliation (Cron)
+
+ARCS supports unattended operation via cron using the same control script.
+
+Behavior:
+
+- arcsctl.sh checks for cron availability
+- Detects existing ARCS cron entries for the same user
+- Creates a daily reconcile job if none exists
+
+Default cron entry:
+
+0 3 * * * cd /opt/arcs && /opt/arcs/admin/arcsctl.sh --ci --log-sanity >> /opt/arcs/logs/cron_arcsctl.log 2>&1
+
+Design goals:
+
+- Runs as the same user that owns the Docker workflow
+- Uses the same idempotent control path as manual execution
+- Skips imports automatically when data is unchanged
+- Avoids secret rotation or destructive actions
+
+Cron presence and status are recorded in metadata for visibility.
+
+---
+
+## 7. State and Metadata
 
 Canonical system state is recorded in:
 
 logs/arcs-state.json
 
 Namespaces include:
+
 - bootstrap
 - uls_import
+- scheduler
 
-Importer metadata includes:
+Importer metadata tracks:
+
 - Source URL
 - HTTP ETag and Last-Modified
 - ZIP checksum and byte size
-- Import start and finish times
+- Import start and finish timestamps
 - Skip reasons when applicable
-- Timestamp of last local data update
+- Timestamp of last successful local data update
 
-This file is authoritative for operational status.
+This file is authoritative for operational status and troubleshooting.
 
 ---
 
-## 7. Security Posture (Baseline)
+## 8. Security Posture (Baseline)
 
 The v1.x baseline intentionally includes:
+
 - Public API
 - No authentication
 - No TLS
 - No rate limiting
 
-This is a deliberate choice to keep the system simple and inspectable.
+This is a deliberate choice to keep the system simple, inspectable,
+and educational.
 
-Planned future enhancements may include:
+Future enhancements (out of scope for baseline):
+
 - External reverse proxy
 - TLS termination
 - Rate limiting
-- IP filtering
 - Authentication layers
-
-These are explicitly out of scope for the baseline release.
 
 ---
 
-## 8. Design Principles Summary
+## 9. Design Principles Summary
 
 - Prefer explicit control paths
 - Make state visible and inspectable
@@ -219,4 +262,3 @@ These are explicitly out of scope for the baseline release.
 - Treat re-runs as normal operation
 - Keep learning value high
 - Use amateur radio as a real integration domain
-
