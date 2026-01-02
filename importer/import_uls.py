@@ -14,7 +14,7 @@ and builds a callbook-friendly view used by the XML API.
 
 Design goals (v1.0+)
 --------------------
-This importer keeps *two categories* of truth:
+This importer keeps three categories of truth:
 
 1) Local execution truth (what ARCS did):
    - last_run_started_at / last_run_finished_at
@@ -27,10 +27,6 @@ This importer keeps *two categories* of truth:
    - source_* fields derived from HTTP headers + downloaded ZIP
      (ETag, Last-Modified, SHA256, bytes)
 
-This separation avoids the common confusion where HTTP Last-Modified is mistaken
-for "when my local system last updated". It is not. It is a property of the
-upstream artifact.
-
 Features (cron/CI friendly)
 ---------------------------
 1) Locking (--lock / --no-lock)
@@ -40,25 +36,19 @@ Features (cron/CI friendly)
 
 2) Skip if unchanged (--skip-if-unchanged)
    - Avoids re-importing if the upstream ZIP has not changed.
-   - Primary signal: HTTP HEAD metadata (ETag / Last-Modified).
-   - Fallback: SHA-256 of the existing local ZIP (if present).
+   - Primary signal: HTTP HEAD metadata (ETag / Last-Modified) compared to prior.
+   - Fallback: SHA-256 of the existing local ZIP (if present) compared to prior.
    - Default: skip-if-unchanged DISABLED (opt-in).
 
 3) Canonical state file
    - Writes importer state to:
-       ./logs/arcs-state.json   (host)
-       /logs/arcs-state.json    (container)
+       /logs/arcs-state.json    (container; compose should mount ./logs -> /logs)
    - Namespace used: "uls_import"
 
-4) Lightweight marker
-   - Writes a simple JSON marker for quick eyeballing:
+4) Lightweight marker (used for quick eyeballing AND as a fallback prior source)
+   - Writes:
        /logs/.last_import
-
-Back-compat / legacy
---------------------
-This file also writes to admin/.bootstrap_complete (KEY=VALUE) for now because
-arcsctl.sh historically reports status from there. We'll update arcsctl.sh
---status after this change to use logs/arcs-state.json as the canonical source.
+   - Can be overridden via --meta-path (see CLI)
 
 Exit codes
 ----------
@@ -102,13 +92,8 @@ SCHEMA_PATH = pathlib.Path("/app/schema.sql")
 STATE_PATH = pathlib.Path(os.environ.get("ARCS_STATE_PATH", "/logs/arcs-state.json"))
 STATE_NAMESPACE = "uls_import"
 
-# Optional lightweight marker (human-friendly; not required for logic)
-LAST_IMPORT_PATH = pathlib.Path(os.environ.get("ARCS_LAST_IMPORT_PATH", "/logs/.last_import"))
-
-# Legacy bootstrap metadata file (kept for now; arcsctl.sh will be updated later)
-BOOTSTRAP_META_PATH_DEFAULT = pathlib.Path(
-    os.environ.get("ARCS_BOOTSTRAP_META_PATH", "/opt/arcs/admin/.bootstrap_complete")
-)
+# Lightweight marker (also used as fallback prior source if canonical is empty)
+DEFAULT_LAST_IMPORT_PATH = pathlib.Path(os.environ.get("ARCS_LAST_IMPORT_PATH", "/logs/.last_import"))
 
 
 def _read_secret(path: str) -> str:
@@ -139,7 +124,7 @@ def utc_now_iso() -> str:
 
 
 # ----------------------------
-# Canonical state (JSON merge)
+# JSON helpers (atomic read/write)
 # ----------------------------
 
 def _load_json(path: pathlib.Path) -> Dict[str, Any]:
@@ -178,101 +163,9 @@ def merge_state_namespace(path: pathlib.Path, ns: str, updates: Dict[str, Any]) 
 
 def write_last_import_marker(path: pathlib.Path, updates: Dict[str, Any]) -> None:
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
-        tmp.write_text(json.dumps(updates, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        tmp.replace(path)
+        _atomic_write_json(path, updates)
     except Exception as e:
         log(f"[WARN] Could not write last import marker {path}: {e}")
-
-
-# ----------------------------
-# Legacy bootstrap metadata (KEY=VALUE) helpers
-# ----------------------------
-
-BOOTSTRAP_PREFIX = "uls_import."
-
-
-def _parse_bootstrap_kv_lines(text: str) -> Tuple[List[str], Dict[str, str]]:
-    lines = text.splitlines(True)
-    kv: Dict[str, str] = {}
-    for ln in lines:
-        s = ln.strip()
-        if not s or s.startswith("#") or "=" not in s:
-            continue
-        k, v = s.split("=", 1)
-        kv[k.strip()] = v.strip()
-    return lines, kv
-
-
-def _is_writable_path(path: pathlib.Path) -> bool:
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        test = path.parent / f".writetest.{os.getpid()}"
-        test.write_text("ok", encoding="utf-8")
-        test.unlink(missing_ok=True)
-        return True
-    except Exception:
-        return False
-
-
-def resolve_bootstrap_meta_path() -> pathlib.Path:
-    if _is_writable_path(BOOTSTRAP_META_PATH_DEFAULT):
-        return BOOTSTRAP_META_PATH_DEFAULT
-    return DATA_DIR / ".bootstrap_complete"
-
-
-def read_bootstrap_meta(path: pathlib.Path) -> Dict[str, str]:
-    if not path.exists():
-        return {}
-    try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-        _, kv = _parse_bootstrap_kv_lines(text)
-        return kv
-    except Exception as e:
-        log(f"[WARN] Could not read bootstrap meta {path}: {e}")
-        return {}
-
-
-def write_bootstrap_meta(path: pathlib.Path, updates: Dict[str, str]) -> None:
-    existing_text = ""
-    if path.exists():
-        try:
-            existing_text = path.read_text(encoding="utf-8", errors="replace")
-        except Exception:
-            existing_text = ""
-
-    lines, kv = _parse_bootstrap_kv_lines(existing_text)
-    kv.update(updates)
-
-    managed_keys = set(updates.keys())
-    out_lines: List[str] = []
-    seen = set()
-
-    for ln in lines:
-        s = ln.strip()
-        if not s or s.startswith("#") or "=" not in s:
-            out_lines.append(ln)
-            continue
-        k = s.split("=", 1)[0].strip()
-        if k in managed_keys:
-            out_lines.append(f"{k}={kv[k]}\n")
-            seen.add(k)
-        else:
-            out_lines.append(ln)
-
-    missing = [k for k in managed_keys if k not in seen]
-    if missing:
-        if existing_text and not existing_text.endswith("\n"):
-            out_lines.append("\n")
-        out_lines.append("# ---- ARCS uls-importer metadata (managed) ----\n")
-        for k in sorted(missing):
-            out_lines.append(f"{k}={kv[k]}\n")
-
-    tmp_path = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path.write_text("".join(out_lines), encoding="utf-8")
-    tmp_path.replace(path)
 
 
 # ----------------------------
@@ -637,16 +530,34 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         formatter_class=argparse.RawTextHelpFormatter,
     )
 
-    p.add_argument("--lock", dest="lock", action="store_true", default=True,
-                   help="Enable DB named lock (default: enabled).")
-    p.add_argument("--no-lock", dest="lock", action="store_false",
-                   help="Disable DB named lock (not recommended).")
+    p.add_argument(
+        "--lock",
+        dest="lock",
+        action="store_true",
+        default=True,
+        help="Enable DB named lock (default: enabled).",
+    )
+    p.add_argument(
+        "--no-lock",
+        dest="lock",
+        action="store_false",
+        help="Disable DB named lock (not recommended).",
+    )
 
-    p.add_argument("--skip-if-unchanged", action="store_true",
-                   help="Skip the entire import when the upstream ZIP appears unchanged (ETag/Last-Modified; fallback zip sha256).")
+    p.add_argument(
+        "--skip-if-unchanged",
+        action="store_true",
+        help="Skip the entire import when the upstream ZIP appears unchanged (ETag/Last-Modified; fallback zip sha256).",
+    )
 
-    p.add_argument("--meta-path", default="",
-                   help="Override legacy bootstrap metadata path (otherwise uses ARCS_BOOTSTRAP_META_PATH or falls back to $DATA_DIR/.bootstrap_complete).")
+    # NOTE: name retained for compatibility with arcsctl.sh.
+    # This now refers to the marker file path (prior source fallback + written on each run),
+    # not any legacy bootstrap metadata.
+    p.add_argument(
+        "--meta-path",
+        default="",
+        help="Override last-import marker path (default: ARCS_LAST_IMPORT_PATH or /logs/.last_import).",
+    )
 
     return p.parse_args(argv)
 
@@ -660,33 +571,21 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     log("[START] ULS import starting")
 
-    prior_state = read_state_namespace(STATE_PATH, STATE_NAMESPACE)
-
-    # Legacy prior (best-effort fallback only; canonical is arcs-state.json)
-    meta_path = pathlib.Path(args.meta_path) if args.meta_path else resolve_bootstrap_meta_path()
-    prior_bootstrap = read_bootstrap_meta(meta_path)
-
-    # If canonical state is empty, fall back to legacy keys (mapped into new names).
-    if not prior_state:
-        prior_state = {
-            "source_url": prior_bootstrap.get(f"{BOOTSTRAP_PREFIX}download_url", ""),
-            "source_zip_sha256": prior_bootstrap.get(f"{BOOTSTRAP_PREFIX}zip_sha256", ""),
-            "source_zip_bytes": int(prior_bootstrap.get(f"{BOOTSTRAP_PREFIX}zip_bytes", "0") or 0),
-            "source_last_modified_at": prior_bootstrap.get(f"{BOOTSTRAP_PREFIX}http_last_modified", ""),
-            "source_etag": prior_bootstrap.get(f"{BOOTSTRAP_PREFIX}http_etag", ""),
-            "last_run_started_at": prior_bootstrap.get(f"{BOOTSTRAP_PREFIX}import_started", ""),
-            "last_run_finished_at": prior_bootstrap.get(f"{BOOTSTRAP_PREFIX}import_finished", ""),
-            "last_run_result": prior_bootstrap.get(f"{BOOTSTRAP_PREFIX}result", ""),
-            "last_run_skip_reason": prior_bootstrap.get(f"{BOOTSTRAP_PREFIX}skip_reason", ""),
-            "local_data_updated_at": prior_bootstrap.get(f"{BOOTSTRAP_PREFIX}local_data_updated_at", ""),
-        }
-
     run_started = utc_now_iso()
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     EXTRACT_DIR.mkdir(parents=True, exist_ok=True)
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    LAST_IMPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    last_import_path = pathlib.Path(args.meta_path) if args.meta_path else DEFAULT_LAST_IMPORT_PATH
+    last_import_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Prior state comes from canonical state first; fallback to marker if needed.
+    prior_state = read_state_namespace(STATE_PATH, STATE_NAMESPACE)
+    if not prior_state:
+        prior_state = _load_json(last_import_path)
+        if prior_state:
+            log(f"[META] Loaded prior marker: {last_import_path}")
 
     conn = connect_db()
     got_lock = False
@@ -701,10 +600,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         did_update_local_data: bool = False,
     ) -> None:
         """
-        Persist state in three places:
+        Persist state in two places (no legacy artifacts):
           1) Canonical JSON state: /logs/arcs-state.json (namespace uls_import)
-          2) Marker JSON: /logs/.last_import
-          3) Legacy KEY=VALUE: admin/.bootstrap_complete (for now)
+          2) Marker JSON:          /logs/.last_import (or --meta-path)
 
         Naming intent:
           - last_run_*   => operational truth about the most recent run attempt
@@ -714,7 +612,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         rm = remote or RemoteMeta()
         run_finished = utc_now_iso()
 
-        # local_data_updated_at should only move forward when we actually refreshed the DB.
         prior_local_updated = str(prior_state.get("local_data_updated_at") or "").strip()
         local_updated = run_finished if did_update_local_data else prior_local_updated
 
@@ -744,27 +641,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             log(f"[WARN] Failed to update state file {STATE_PATH}: {e}")
 
         # Lightweight marker
-        write_last_import_marker(LAST_IMPORT_PATH, updates)
-        log(f"[META] Updated: {LAST_IMPORT_PATH}")
-
-        # Legacy bootstrap_complete (best-effort)
-        try:
-            legacy_updates = {
-                f"{BOOTSTRAP_PREFIX}download_url": str(updates["source_url"]),
-                f"{BOOTSTRAP_PREFIX}http_etag": str(updates["source_etag"]),
-                f"{BOOTSTRAP_PREFIX}http_last_modified": str(updates["source_last_modified_at"]),
-                f"{BOOTSTRAP_PREFIX}zip_sha256": str(updates["source_zip_sha256"]),
-                f"{BOOTSTRAP_PREFIX}zip_bytes": str(updates["source_zip_bytes"]),
-                f"{BOOTSTRAP_PREFIX}import_started": str(updates["last_run_started_at"]),
-                f"{BOOTSTRAP_PREFIX}import_finished": str(updates["last_run_finished_at"]),
-                f"{BOOTSTRAP_PREFIX}result": str(updates["last_run_result"]),
-                f"{BOOTSTRAP_PREFIX}skip_reason": str(updates["last_run_skip_reason"]),
-                f"{BOOTSTRAP_PREFIX}local_data_updated_at": str(updates["local_data_updated_at"]),
-            }
-            write_bootstrap_meta(meta_path, legacy_updates)
-            log(f"[META] Updated legacy: {meta_path}")
-        except Exception as e:
-            log(f"[WARN] Could not update legacy bootstrap meta {meta_path}: {e}")
+        write_last_import_marker(last_import_path, updates)
+        log(f"[META] Updated: {last_import_path}")
 
     try:
         if args.lock:
@@ -829,7 +707,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         merge_into_final(conn)
 
-        # Diagnostics / sanity output (kept; useful in logs)
+        # Diagnostics / sanity output
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) AS c FROM hd;")
             hd_count = cur.fetchone()["c"]

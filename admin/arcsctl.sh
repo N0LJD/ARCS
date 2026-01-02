@@ -4,539 +4,563 @@ set -euo pipefail
 # -----------------------------------------------------------------------------
 # admin/arcsctl.sh
 #
-# Purpose:
-#   ARCS control script (install, update, reconciliation).
+# ARCS Control Script (modernized: no legacy/back-compat artifacts)
 #
-# Author: Edward Moss - N0LJD
+# Modes:
+#   (no args)         Reconcile/update ARCS safely (start DB, run importer, start services, sanity-check)
+#   --status          Print canonical state (logs/arcs-state.json) and exit
 #
-# Key rules:
-#   - Secrets rotation happens ONLY with --coldstart + (--rotate-secrets or --force).
-#   - Re-running arcsctl.sh on an existing system is expected and safe.
+# Flags:
+#   --coldstart       Stop stack and wipe named volumes (fresh install / rebuild workflow)
+#   --rotate-secrets  Generate new local secrets (allowed only with --coldstart)
+#   --force           Non-interactive; implies --rotate-secrets (still requires --coldstart)
+#   --ci              Non-interactive style output; also enables sanity-check logging
+#   --log-sanity      Enable sanity-check logging even when not using --ci
+#   -h, --help        Show this help and exit
 #
-# High-level flow:
-#   1) Optional coldstart wipe (down + remove named volumes)
-#   2) Optional secrets rotation (coldstart only)
-#   3) Start MariaDB only; wait healthy
-#   4) Run importer (schema + data + views; importer handles "skip if unchanged")
-#   5) Ensure DB user `xml_api` exists with least privilege (SELECT on uls.v_callbook only)
-#   6) Start xml-api + web-ui
-#   7) Run canonical sanity checks (admin/sanity-check.sh)
-#   8) Completion information saved in logs/arcs-state.json (canonical) + admin/.bootstrap_complete (legacy)
+# Canonical state:
+#   logs/arcs-state.json
 #
-# Status mode:
-#   --status prints a concise view from logs/arcs-state.json (canonical),
-#   and falls back to admin/.bootstrap_complete (legacy) if needed.
+# Importer behavior:
+#   Invoked with: --skip-if-unchanged --meta-path /logs/.last_import
+#
+# Scheduler behavior (cron):
+#   - Uses the SAME user that runs this script (no -u; installs into that user's crontab)
+#   - If crontab is missing, warns and continues
+#   - If no arcsctl entry exists, installs daily job at 03:00 local time
 # -----------------------------------------------------------------------------
-
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$ROOT_DIR"
-
-# -----------------------------
-# Defaults / flags
-# -----------------------------
-FORCE="no"
-COLDSTART="no"
-ROTATE_SECRETS="no"
-CI="no"
-LOG_SANITY="no"
-STATUS_ONLY="no"
 
 HEARTBEAT_INTERVAL="${HEARTBEAT_INTERVAL:-1}"
 
-# -----------------------------
-# Logging helpers
-# -----------------------------
-log()  { printf '[arcsctl] %s\n' "$*"; }
-warn() { printf '[arcsctl] WARN: %s\n' "$*" >&2; }
-die()  { printf '[arcsctl] ERROR: %s\n' "$*" >&2; exit 2; }
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-need_file() {
-  local f="$1"
-  [ -f "$f" ] || die "Missing required file: $f"
-}
+LOG_DIR="${PROJECT_ROOT}/logs"
+SECRETS_DIR="${PROJECT_ROOT}/secrets"
+STATE_FILE="${LOG_DIR}/arcs-state.json"
+IMPORT_META_PATH="/logs/.last_import"
 
-usage() {
-  printf '%s\n' \
-"Usage: ./admin/arcsctl.sh [--status] [--coldstart] [--rotate-secrets] [--force] [--ci] [--log-sanity]" \
-"" \
-"Modes:" \
-"  (no args)         Reconcile/update ARCS safely (start DB, run importer, start services, sanity-check)" \
-"  --status          Print canonical state (logs/arcs-state.json) and exit" \
-"" \
-"Flags:" \
-"  --coldstart       Stop stack and wipe named volumes (fresh install / rebuild workflow)" \
-"  --rotate-secrets  Generate new local secrets (allowed only with --coldstart)" \
-"  --force           Non-interactive; implies --rotate-secrets (still requires --coldstart)" \
-"  --ci              Non-interactive style output; also enables sanity-check logging" \
-"  --log-sanity      Enable sanity-check logging even when not using --ci" \
-"  -h, --help        Show this help and exit" \
-"" \
-"Env:" \
-"  HEARTBEAT_INTERVAL=1   Seconds between progress dots for long steps"
-}
-
-# -----------------------------
-# Timing helpers (total only)
-# -----------------------------
-SCRIPT_START_EPOCH="$(date +%s)"
-
-fmt_seconds() {
-  local s="$1"
-  local h=$((s / 3600))
-  local m=$(((s % 3600) / 60))
-  local r=$((s % 60))
-  if (( h > 0 )); then
-    printf '%d:%02d:%02d' "$h" "$m" "$r"
-  else
-    printf '%02d:%02d' "$m" "$r"
-  fi
-}
-
-# -----------------------------
-# Heartbeat helpers
-# -----------------------------
-HEARTBEAT_PID=""
-
-start_heartbeat() {
-  local msg="${1:-Processing}"
-  stop_heartbeat || true
-
-  if [ "${CI:-no}" = "yes" ]; then
-    return 0
-  fi
-
-  printf '[arcsctl] %s ' "$msg"
-  (
-    while true; do
-      printf '.'
-      sleep "${HEARTBEAT_INTERVAL}"
-    done
-  ) &
-  HEARTBEAT_PID="$!"
-}
-
-stop_heartbeat() {
-  if [ -n "${HEARTBEAT_PID:-}" ]; then
-    kill "$HEARTBEAT_PID" 2>/dev/null || true
-    wait "$HEARTBEAT_PID" 2>/dev/null || true
-    HEARTBEAT_PID=""
-    printf '\n'
-  fi
-}
-
-cleanup() {
-  stop_heartbeat || true
-}
-trap cleanup EXIT
-
-# -----------------------------
-# Arg parsing
-# -----------------------------
-for arg in "$@"; do
-  case "$arg" in
-    --force) FORCE="yes"; ROTATE_SECRETS="yes" ;;
-    --coldstart) COLDSTART="yes" ;;
-    --rotate-secrets) ROTATE_SECRETS="yes" ;;
-    --ci) CI="yes" ;;
-    --log-sanity) LOG_SANITY="yes" ;;
-    --status) STATUS_ONLY="yes" ;;
-    -h|--help) usage; exit 0 ;;
-    "") ;;
-    *) die "Unknown arg: $arg" ;;
-  esac
-done
-
-# Guard: rotate secrets ONLY on coldstart
-if [ "$ROTATE_SECRETS" = "yes" ] && [ "$COLDSTART" != "yes" ]; then
-  die "Refusing to rotate secrets without --coldstart. Use: ./admin/arcsctl.sh --coldstart --rotate-secrets (or --force)."
-fi
-
-# ---------------------------------------------------------------------------
-# First-time install convenience:
-# If secrets are missing, assume a brand-new install and enable:
-#   - --coldstart
-#   - --rotate-secrets
-# ---------------------------------------------------------------------------
-if [ "$COLDSTART" != "yes" ] && [ "$ROTATE_SECRETS" != "yes" ]; then
-  if [ ! -f "$ROOT_DIR/secrets/mariadb_root_password.txt" ] \
-  || [ ! -f "$ROOT_DIR/secrets/mariadb_user_password.txt" ] \
-  || [ ! -f "$ROOT_DIR/secrets/xml_api_password.txt" ]; then
-    log "Secrets not found (first run). Assuming fresh install: enabling --coldstart and generating secrets."
-    COLDSTART="yes"
-    ROTATE_SECRETS="yes"
-  fi
-fi
-
-# ---------------------------------------------------------------------------
-# Mode resolution
-# ---------------------------------------------------------------------------
-FRESH_INSTALL="no"
-if [ ! -f "$ROOT_DIR/admin/.bootstrap_complete" ]; then
-  FRESH_INSTALL="yes"
-fi
-
-log "Mode resolved: fresh-install=${FRESH_INSTALL} coldstart=${COLDSTART} rotate-secrets=${ROTATE_SECRETS} ci=${CI}"
-
-if [ "$COLDSTART" = "yes" ]; then
-  printf '\n[arcsctl] NOTE: A coldstart (fresh install) may take several minutes to complete.\n\n'
-fi
-
-# -----------------------------
-# Paths / service names
-# -----------------------------
-SECRETS_DIR="$ROOT_DIR/secrets"
-MDB_ROOT_PW_FILE="$SECRETS_DIR/mariadb_root_password.txt"
-MDB_USER_PW_FILE="$SECRETS_DIR/mariadb_user_password.txt"
-XML_API_PW_FILE="$SECRETS_DIR/xml_api_password.txt"
-
+# Compose service names
 SVC_DB="uls-mariadb"
 SVC_IMPORTER="uls-importer"
 SVC_API="xml-api"
 SVC_UI="web-ui"
 
-CTR_DB="arcs-uls-mariadb"
+# Named volumes (baseline)
+VOL_DB_DATA="arcs_uls_db_data"
+VOL_CACHE="arcs_uls_cache"
 
-# Canonical state/log paths
-LOGS_DIR="$ROOT_DIR/logs"
-ARCS_STATE_JSON="$LOGS_DIR/arcs-state.json"
-BOOTSTRAP_MARKER_LEGACY="$ROOT_DIR/admin/.bootstrap_complete"
+# Secrets
+SECRET_DB_ROOT="${SECRETS_DIR}/mariadb_root_password.txt"
+SECRET_DB_USER="${SECRETS_DIR}/mariadb_user_password.txt"
+SECRET_XML_API="${SECRETS_DIR}/xml_api_password.txt"
 
-mkdir -p "$LOGS_DIR"
+# DB policy
+DB_XML_API_USER="xml_api"
+DB_NAME="uls"
+DB_VIEW="v_callbook"
 
-# -----------------------------
-# Canonical state writer (JSON merge)
-# -----------------------------
-merge_bootstrap_state_json() {
-  local started_at="$1"
-  local finished_at="$2"
-  local result="$3"
-  local elapsed_seconds="$4"
-  local elapsed_human="$5"
+log()  { echo "[arcsctl] $*"; }
+warn() { echo "[arcsctl] WARN: $*" >&2; }
+err()  { echo "[arcsctl] ERROR: $*" >&2; }
+die()  { err "$*"; exit 1; }
 
-  python3 - <<PY
-import json
-from pathlib import Path
+usage() {
+  cat <<'USAGE'
+Usage: ./admin/arcsctl.sh [--status] [--coldstart] [--rotate-secrets] [--force] [--ci] [--log-sanity]
 
-p = Path(${ARCS_STATE_JSON@Q})
-obj = {}
-if p.exists():
-    try:
-        obj = json.loads(p.read_text(encoding="utf-8", errors="replace") or "{}")
-        if not isinstance(obj, dict):
-            obj = {}
-    except Exception:
-        obj = {}
+Modes:
+  (no args)         Reconcile/update ARCS safely (start DB, run importer, start services, sanity-check)
+  --status          Print canonical state (logs/arcs-state.json) and exit
 
-obj.setdefault("bootstrap", {})
-obj["bootstrap"].update({
-    "started_at_utc": ${started_at@Q},
-    "completed_at_utc": ${finished_at@Q},
-    "result": ${result@Q},
-    "elapsed_seconds": str(${elapsed_seconds@Q}),
-    "elapsed_human": ${elapsed_human@Q},
-    "fresh_install": ${FRESH_INSTALL@Q},
-    "coldstart": ${COLDSTART@Q},
-    "rotate_secrets": ${ROTATE_SECRETS@Q},
-    "ci_mode": ${CI@Q},
-})
+Flags:
+  --coldstart       Stop stack and wipe named volumes (fresh install / rebuild workflow)
+  --rotate-secrets  Generate new local secrets (allowed only with --coldstart)
+  --force           Non-interactive; implies --rotate-secrets (still requires --coldstart)
+  --ci              Non-interactive style output; also enables sanity-check logging
+  --log-sanity      Enable sanity-check logging even when not using --ci
+  -h, --help        Show this help and exit
 
-p.parent.mkdir(parents=True, exist_ok=True)
-tmp = p.with_suffix(p.suffix + ".tmp")
-tmp.write_text(json.dumps(obj, indent=2, sort_keys=True) + "\\n", encoding="utf-8")
-tmp.replace(p)
-PY
+Env:
+  HEARTBEAT_INTERVAL=1   Seconds between progress dots for long steps
+USAGE
 }
 
-print_status() {
-  log "Status requested (--status)."
+utc_now_iso() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 
-  if [ -f "$ARCS_STATE_JSON" ]; then
-    log "Canonical state: logs/arcs-state.json"
-    python3 - <<PY
-import json
-from pathlib import Path
-
-p = Path(${ARCS_STATE_JSON@Q})
-obj = json.loads(p.read_text(encoding="utf-8", errors="replace") or "{}")
-if not isinstance(obj, dict):
-    obj = {}
-
-def get(ns, k, d=""):
-    v = obj.get(ns, {}).get(k, d)
-    return "" if v is None else str(v)
-
-def pick(ns, *keys, default=""):
-    d = obj.get(ns, {})
-    if not isinstance(d, dict):
-        return default
-    for k in keys:
-        v = d.get(k)
-        if v not in (None, "", []):
-            return str(v)
-    return default
-
-def short(s, n=12):
-    s = str(s or "")
-    return (s[:n] + "…") if len(s) > n else s
-
-print("[arcsctl] --- bootstrap ---")
-print(f"[arcsctl]   result: {get('bootstrap','result','')}")
-print(f"[arcsctl]   started_at_utc: {get('bootstrap','started_at_utc','')}")
-print(f"[arcsctl]   completed_at_utc: {get('bootstrap','completed_at_utc','')}")
-eh = get('bootstrap','elapsed_human','')
-es = get('bootstrap','elapsed_seconds','')
-print(f"[arcsctl]   elapsed: {eh} ({es}s)")
-print(f"[arcsctl]   coldstart: {get('bootstrap','coldstart','')} rotate_secrets: {get('bootstrap','rotate_secrets','')} ci_mode: {get('bootstrap','ci_mode','')}")
-print()
-
-ui = obj.get("uls_import", {})
-print("[arcsctl] --- uls_import ---")
-if isinstance(ui, dict) and ui:
-    # Prefer canonical "clear" fields, fallback to legacy names if needed
-    last_result = pick("uls_import", "last_run_result", "result", default="")
-    last_skip   = pick("uls_import", "last_run_skip_reason", "skip_reason", default="")
-    last_start  = pick("uls_import", "last_run_started_at", "import_started", default="")
-    last_end    = pick("uls_import", "last_run_finished_at", "import_finished", default="")
-    local_upd   = pick("uls_import", "local_data_updated_at", default="")
-    src_url     = pick("uls_import", "source_url", "download_url", default="")
-    src_lm      = pick("uls_import", "source_last_modified_at", "http_last_modified", default="")
-    src_etag    = pick("uls_import", "source_etag", "http_etag", default="")
-    src_sha     = pick("uls_import", "source_zip_sha256", "zip_sha256", default="")
-    src_bytes   = pick("uls_import", "source_zip_bytes", "zip_bytes", default="")
-
-    print(f"[arcsctl]   last_run_result: {last_result}")
-    print(f"[arcsctl]   last_run_skip_reason: {last_skip}")
-    print(f"[arcsctl]   last_run_started_at: {last_start}")
-    print(f"[arcsctl]   last_run_finished_at: {last_end}")
-    if local_upd:
-        print(f"[arcsctl]   local_data_updated_at: {local_upd}")
-    print(f"[arcsctl]   source_url: {src_url}")
-    print(f"[arcsctl]   source_last_modified_at: {src_lm}")
-    print(f"[arcsctl]   source_etag: {src_etag}")
-    print(f"[arcsctl]   source_zip_sha256: {src_sha} (short: {short(src_sha)})")
-    print(f"[arcsctl]   source_zip_bytes: {src_bytes}")
-else:
-    print("[arcsctl]   (no importer state found yet in arcs-state.json)")
-PY
-    return 0
-  fi
-
-  warn "No canonical state file found at logs/arcs-state.json"
-  if [ -f "$BOOTSTRAP_MARKER_LEGACY" ]; then
-    log "Legacy bootstrap metadata: admin/.bootstrap_complete"
-    sed 's/^/[arcsctl]   /' "$BOOTSTRAP_MARKER_LEGACY"
-  else
-    warn "No legacy bootstrap metadata found at admin/.bootstrap_complete"
-    warn "Run: ./admin/arcsctl.sh (or ./admin/arcsctl.sh --coldstart) to perform bootstrap."
-  fi
+ensure_dirs() {
+  mkdir -p "${LOG_DIR}" "${SECRETS_DIR}"
+  chmod 700 "${LOG_DIR}" || true
 }
 
-# Exit early for status mode (no Docker actions)
-if [ "$STATUS_ONLY" = "yes" ]; then
-  print_status
-  exit 0
-fi
+compose() { (cd "${PROJECT_ROOT}" && docker compose "$@"); }
 
-# -----------------------------
-# Core helpers
-# -----------------------------
-random_pw() {
-  tr -dc 'A-Za-z0-9_@#%+=.,:-' </dev/urandom | head -c 32
+compose_ps_q() { compose ps -q "$1" 2>/dev/null || true; }
+
+container_health() {
+  local cid="$1"
+  docker inspect --format='{{.State.Health.Status}}' "$cid" 2>/dev/null || echo "unknown"
 }
 
-rotate_secrets() {
-  log "Rotating secrets (coldstart only)..."
-  mkdir -p "$SECRETS_DIR"
-  umask 077
-
-  printf '%s\n' "$(random_pw)" > "$MDB_ROOT_PW_FILE"
-  printf '%s\n' "$(random_pw)" > "$MDB_USER_PW_FILE"
-  printf '%s\n' "$(random_pw)" > "$XML_API_PW_FILE"
-
-  chmod 600 "$MDB_ROOT_PW_FILE" "$MDB_USER_PW_FILE" "$XML_API_PW_FILE" || true
-  log "Secrets written:"
-  log "  $MDB_ROOT_PW_FILE"
-  log "  $MDB_USER_PW_FILE"
-  log "  $XML_API_PW_FILE"
-}
-
-coldstart_wipe() {
-  log "Coldstart requested: stopping stack + wiping named volumes..."
-  docker compose down --remove-orphans || true
-
-  docker volume rm arcs_uls_db_data 2>/dev/null || true
-  docker volume rm arcs_uls_cache   2>/dev/null || true
-
-  log "Coldstart wipe complete."
-}
-
-wait_mariadb_healthy() {
-  local tries="${1:-90}"
-  local delay="${2:-2}"
-
-  log "Waiting for MariaDB health (tries=$tries delay=${delay}s)..."
-  for _i in $(seq 1 "$tries"); do
-    if docker inspect --format '{{.State.Health.Status}}' "$CTR_DB" 2>/dev/null | grep -qx healthy; then
-      log "MariaDB is healthy."
-      return 0
+wait_for_db_healthy() {
+  local tries="$1"
+  local delay="$2"
+  log "Waiting for MariaDB health (tries=${tries} delay=${delay}s)..."
+  local i=0
+  while [ "$i" -lt "$tries" ]; do
+    local cid
+    cid="$(compose_ps_q "${SVC_DB}")"
+    if [ -n "${cid}" ]; then
+      local h
+      h="$(container_health "${cid}")"
+      if [ "${h}" = "healthy" ]; then
+        log "MariaDB is healthy."
+        return 0
+      fi
     fi
-    sleep "$delay"
+    i=$((i+1))
+    sleep "${delay}"
   done
   die "MariaDB did not become healthy in time."
 }
 
-run_importer() {
-  log "Running importer (schema + data + views; may take a while)..."
+volume_rm_if_exists() {
+  local v="$1"
+  if docker volume inspect "${v}" >/dev/null 2>&1; then
+    docker volume rm -f "${v}" >/dev/null 2>&1 || true
+  fi
+}
 
-  mkdir -p "$LOGS_DIR"
-  local log_file="$LOGS_DIR/importer_$(date +%Y%m%d_%H%M%S).log"
-  log "Importer output: $log_file"
+gen_secret() { openssl rand -base64 32 | tr -d '\n'; }
 
-  start_heartbeat "Importer running (still processing)"
-  set +e
-  docker compose run --rm "$SVC_IMPORTER" >"$log_file" 2>&1
-  local rc=$?
-  set -e
-  stop_heartbeat
+write_secrets() {
+  umask 077
+  echo "$(gen_secret)" > "${SECRET_DB_ROOT}"
+  echo "$(gen_secret)" > "${SECRET_DB_USER}"
+  echo "$(gen_secret)" > "${SECRET_XML_API}"
+  chmod 600 "${SECRET_DB_ROOT}" "${SECRET_DB_USER}" "${SECRET_XML_API}" || true
+}
 
-  printf '\n'
+require_secrets_exist() {
+  [ -f "${SECRET_DB_ROOT}" ] || die "Missing secret: ${SECRET_DB_ROOT}"
+  [ -f "${SECRET_DB_USER}" ] || die "Missing secret: ${SECRET_DB_USER}"
+  [ -f "${SECRET_XML_API}" ] || die "Missing secret: ${SECRET_XML_API}"
+}
 
-  if [ "$rc" -ne 0 ]; then
-    log "Importer failed (exit=$rc). Last 50 lines:"
-    tail -n 50 "$log_file" | sed 's/^/[arcsctl]   /'
-    die "Importer failed. See full log: $log_file"
+json_write_bootstrap() {
+  local started_at="$1"
+  local completed_at="$2"
+  local elapsed_seconds="$3"
+  local elapsed_human="$4"
+  local coldstart="$5"
+  local rotate_secrets="$6"
+  local ci_mode="$7"
+  local result="$8"
+
+  python3 - "${STATE_FILE}" \
+    "${result}" "${started_at}" "${completed_at}" \
+    "${elapsed_seconds}" "${elapsed_human}" \
+    "${coldstart}" "${rotate_secrets}" "${ci_mode}" <<'PY'
+import json, sys, os
+
+path = sys.argv[1]
+result = sys.argv[2]
+started_at = sys.argv[3]
+completed_at = sys.argv[4]
+elapsed_seconds = sys.argv[5]
+elapsed_human = sys.argv[6]
+coldstart = sys.argv[7]
+rotate_secrets = sys.argv[8]
+ci_mode = sys.argv[9]
+
+doc = {}
+if os.path.exists(path):
+  try:
+    with open(path, "r", encoding="utf-8") as f:
+      doc = json.load(f)
+  except Exception:
+    doc = {}
+
+doc.setdefault("bootstrap", {})
+doc["bootstrap"].update({
+  "result": result,
+  "started_at_utc": started_at,
+  "completed_at_utc": completed_at,
+  "elapsed_seconds": str(elapsed_seconds),
+  "elapsed_human": elapsed_human,
+  "coldstart": coldstart,
+  "rotate_secrets": rotate_secrets,
+  "ci_mode": ci_mode
+})
+
+os.makedirs(os.path.dirname(path), exist_ok=True)
+with open(path, "w", encoding="utf-8") as f:
+  json.dump(doc, f, indent=2, sort_keys=True)
+  f.write("\n")
+PY
+}
+
+json_merge_scheduler() {
+  # Merge scheduler metadata into logs/arcs-state.json under "scheduler"
+  local crontab_available="$1"   # yes/no
+  local entry_present="$2"       # yes/no
+  local entry_installed="$3"     # yes/no
+  local entry_line="$4"          # string (may be empty)
+  local owner_user="$5"          # who ran arcsctl (effective user)
+  local owner_uid="$6"
+  local owner_gid="$7"
+
+  python3 - "${STATE_FILE}" \
+    "${crontab_available}" "${entry_present}" "${entry_installed}" "${entry_line}" \
+    "${owner_user}" "${owner_uid}" "${owner_gid}" <<'PY'
+import json, sys, os
+
+path = sys.argv[1]
+crontab_available = sys.argv[2]
+entry_present = sys.argv[3]
+entry_installed = sys.argv[4]
+entry_line = sys.argv[5]
+owner_user = sys.argv[6]
+owner_uid = sys.argv[7]
+owner_gid = sys.argv[8]
+
+doc = {}
+if os.path.exists(path):
+  try:
+    with open(path, "r", encoding="utf-8") as f:
+      doc = json.load(f)
+  except Exception:
+    doc = {}
+
+doc.setdefault("scheduler", {})
+doc["scheduler"].update({
+  "crontab_available": crontab_available,
+  "daily_3am_entry_present": entry_present,
+  "daily_3am_entry_installed_this_run": entry_installed,
+  "daily_3am_entry": entry_line,
+  "installed_for_user": owner_user,
+  "installed_for_uid": owner_uid,
+  "installed_for_gid": owner_gid
+})
+
+os.makedirs(os.path.dirname(path), exist_ok=True)
+with open(path, "w", encoding="utf-8") as f:
+  json.dump(doc, f, indent=2, sort_keys=True)
+  f.write("\n")
+PY
+}
+
+ensure_cron_daily() {
+  # Install into the SAME user's crontab that runs arcsctl.sh.
+  # Never hard-fail the run; this is a convenience + auto-update path.
+
+  local owner_user owner_uid owner_gid
+  owner_user="$(id -un 2>/dev/null || echo unknown)"
+  owner_uid="$(id -u 2>/dev/null || echo -1)"
+  owner_gid="$(id -g 2>/dev/null || echo -1)"
+
+  if ! command -v crontab >/dev/null 2>&1; then
+    warn "crontab not found. To enable automatic daily updates, install cron (e.g., 'cron' or 'cronie') and re-run arcsctl."
+    json_merge_scheduler "no" "no" "no" "" "${owner_user}" "${owner_uid}" "${owner_gid}"
+    return 0
   fi
 
-  log "Importer complete."
+  local job_cmd job_line existing tmp installed="no" present="no"
+
+  # Cron uses local time. Use absolute paths and force working directory.
+  # Use --ci --log-sanity to get consistent logging in logs/cron_arcsctl.log.
+  job_cmd="cd ${PROJECT_ROOT} && ${PROJECT_ROOT}/admin/arcsctl.sh --ci --log-sanity >> ${PROJECT_ROOT}/logs/cron_arcsctl.log 2>&1"
+  job_line="0 3 * * * ${job_cmd} # ARCS daily reconcile"
+
+  existing="$(crontab -l 2>/dev/null || true)"
+
+  # "Entry exists" means any crontab line referencing this arcsctl path.
+  if printf "%s\n" "${existing}" | grep -Fq "${PROJECT_ROOT}/admin/arcsctl.sh"; then
+    present="yes"
+    log "Cron entry already present for arcsctl.sh (user=${owner_user})"
+    json_merge_scheduler "yes" "yes" "no" "${job_line}" "${owner_user}" "${owner_uid}" "${owner_gid}"
+    return 0
+  fi
+
+  tmp="$(mktemp)"
+  {
+    # Preserve existing (drop blank lines only)
+    printf "%s\n" "${existing}" | sed '/^[[:space:]]*$/d'
+    echo "${job_line}"
+  } > "${tmp}"
+
+  if crontab "${tmp}"; then
+    installed="yes"
+    present="yes"
+    log "Cron entry installed for user=${owner_user}: daily at 03:00"
+    log "Cron line: ${job_line}"
+  else
+    warn "Failed to install crontab entry for user=${owner_user} (continuing)."
+  fi
+  rm -f "${tmp}"
+
+  json_merge_scheduler "yes" "${present}" "${installed}" "${job_line}" "${owner_user}" "${owner_uid}" "${owner_gid}"
+  return 0
+}
+
+run_importer() {
+  ensure_dirs
+  local ts
+  ts="$(date -u +%Y%m%d_%H%M%S)"
+  local log_file="${LOG_DIR}/importer_${ts}.log"
+
+  log "Running importer (schema + data + views; may take a while)..."
+  log "Importer output: ${log_file}"
+  log "Importer args: --skip-if-unchanged --meta-path ${IMPORT_META_PATH}"
+
+  set +e
+  (
+    compose run --rm "${SVC_IMPORTER}" \
+      --skip-if-unchanged \
+      --meta-path "${IMPORT_META_PATH}" \
+      >"${log_file}" 2>&1
+  ) &
+  local pid=$!
+  set -e
+
+  log -n "Importer running (still processing) "
+  while kill -0 "${pid}" >/dev/null 2>&1; do
+    printf "."
+    sleep "${HEARTBEAT_INTERVAL}"
+  done
+  echo ""
+
+  wait "${pid}" || {
+    err "Importer failed. See: ${log_file}"
+    return 1
+  }
+
+  if grep -q '^\[SKIP\]' "${log_file}"; then
+    log "Importer skipped (unchanged source)."
+  else
+    log "Importer complete."
+  fi
+  return 0
+}
+
+db_exec_root() {
+  local sql="$1"
+  local root_pw
+  root_pw="$(cat "${SECRET_DB_ROOT}")"
+
+  if compose exec -T "${SVC_DB}" mariadb --version >/dev/null 2>&1; then
+    compose exec -T "${SVC_DB}" mariadb -uroot "-p${root_pw}" -e "${sql}"
+  else
+    compose exec -T "${SVC_DB}" mysql -uroot "-p${root_pw}" -e "${sql}"
+  fi
 }
 
 ensure_xml_api_user() {
-  need_file "$MDB_ROOT_PW_FILE"
-  need_file "$XML_API_PW_FILE"
+  log "Ensuring DB user '${DB_XML_API_USER}' exists, password is synchronized, and privileges are view-only (${DB_NAME}.${DB_VIEW})..."
+  local api_pw
+  api_pw="$(cat "${SECRET_XML_API}")"
 
-  local rootpw xmlpw
-  rootpw="$(cat "$MDB_ROOT_PW_FILE")"
-  xmlpw="$(cat "$XML_API_PW_FILE")"
+  db_exec_root "CREATE USER IF NOT EXISTS '${DB_XML_API_USER}'@'%' IDENTIFIED BY '${api_pw}';"
+  db_exec_root "ALTER USER '${DB_XML_API_USER}'@'%' IDENTIFIED BY '${api_pw}';"
+  db_exec_root "REVOKE ALL PRIVILEGES, GRANT OPTION FROM '${DB_XML_API_USER}'@'%';"
+  db_exec_root "GRANT SELECT ON \`${DB_NAME}\`.\`${DB_VIEW}\` TO '${DB_XML_API_USER}'@'%';"
+  db_exec_root "FLUSH PRIVILEGES;"
 
-  log "Ensuring DB user 'xml_api' exists, password is synchronized, and privileges are view-only (uls.v_callbook)..."
+  local grants
+  grants="$(db_exec_root "SHOW GRANTS FOR '${DB_XML_API_USER}'@'%';" | sed '1d' || true)"
+  log "xml_api grants now set to:"
+  while IFS= read -r line; do
+    [ -n "${line}" ] && log "  ${line}"
+  done <<< "${grants}"
 
-  docker compose exec -T "$SVC_DB" \
-    mariadb -uroot -p"$rootpw" -e "
-      CREATE USER IF NOT EXISTS 'xml_api'@'%' IDENTIFIED BY '${xmlpw}';
-      ALTER USER 'xml_api'@'%' IDENTIFIED BY '${xmlpw}';
-      FLUSH PRIVILEGES;
-    " >/dev/null
-
-  docker compose exec -T "$SVC_DB" \
-    mariadb -uroot -p"$rootpw" -e "
-      REVOKE ALL PRIVILEGES, GRANT OPTION FROM 'xml_api'@'%';
-      GRANT SELECT ON \`uls\`.\`v_callbook\` TO 'xml_api'@'%';
-      FLUSH PRIVILEGES;
-    " >/dev/null
-
-  if ! docker compose exec -T "$SVC_DB" \
-      mariadb -uroot -p"$rootpw" -N -e "USE \`uls\`; SHOW FULL TABLES LIKE 'v_callbook';" \
-      | grep -qi 'v_callbook'; then
-    die "Required view 'uls.v_callbook' was not found. Import/schema may be incomplete."
-  fi
-
-  if [ "${CI:-no}" != "yes" ]; then
-    log "xml_api grants now set to:"
-    docker compose exec -T "$SVC_DB" \
-      mariadb -uroot -p"$rootpw" -N -e "SHOW GRANTS FOR 'xml_api'@'%';" \
-      | sed 's/^/[arcsctl]   /'
-  fi
-
-  log "DB user 'xml_api' OK (restricted to SELECT on uls.v_callbook)."
+  log "DB user '${DB_XML_API_USER}' OK (restricted to SELECT on ${DB_NAME}.${DB_VIEW})."
 }
 
-start_services() {
-  log "Starting MariaDB..."
-  docker compose up -d "$SVC_DB"
+run_sanity() {
+  local ci_mode="$1"
+  local log_sanity="$2"
 
-  wait_mariadb_healthy 90 2
-
-  run_importer
-  ensure_xml_api_user
-
-  log "Starting runtime services (xml-api + web-ui)..."
-  docker compose up -d "$SVC_API" "$SVC_UI"
+  log "Running sanity checks: admin/sanity-check.sh"
+  (
+    cd "${PROJECT_ROOT}"
+    if [ "${ci_mode}" = "yes" ] || [ "${log_sanity}" = "yes" ]; then
+      export SANITY_LOG=1
+    fi
+    ./admin/sanity-check.sh
+  )
 }
 
-run_sanity_check() {
-  local sanity="$ROOT_DIR/admin/sanity-check.sh"
-  local log_flag=""
-
-  if [ "${CI:-no}" = "yes" ] || [ "${LOG_SANITY:-no}" = "yes" ]; then
-    log_flag="--log"
+status_print() {
+  log "Status requested (--status)."
+  log "Canonical state: logs/arcs-state.json"
+  if [ ! -f "${STATE_FILE}" ]; then
+    warn "No state file found at: ${STATE_FILE}"
+    exit 0
   fi
 
-  if [ -x "$sanity" ]; then
-    log "Running sanity checks: admin/sanity-check.sh ${log_flag}"
-    echo
-    "$sanity" W1AW ${log_flag} || die "sanity-check.sh reported failure"
-  else
-    warn "admin/sanity-check.sh not found or not executable; skipping."
-  fi
+  python3 - "${STATE_FILE}" <<'PY'
+import json, sys
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8") as f:
+  doc = json.load(f)
+
+def show_block(name, keys, hide_empty=None):
+  v = doc.get(name, {})
+  print(f"[arcsctl] --- {name} ---")
+  if not isinstance(v, dict) or not v:
+    print("[arcsctl]   (missing)\n")
+    return
+  hide_empty = set(hide_empty or [])
+  for k in keys:
+    if k not in v:
+      continue
+    if k in hide_empty and str(v.get(k,"")).strip() == "":
+      continue
+    if k == "source_zip_sha256" and isinstance(v[k], str) and len(v[k]) > 20:
+      short = v[k][:12] + "…"
+      print(f"[arcsctl]   {k}: {v[k]} (short: {short})")
+    else:
+      print(f"[arcsctl]   {k}: {v[k]}")
+  print("")
+
+show_block("bootstrap", ["result","started_at_utc","completed_at_utc","elapsed_human","elapsed_seconds","coldstart","rotate_secrets","ci_mode"])
+
+show_block("uls_import", [
+  "last_run_result","last_run_skip_reason",
+  "last_run_started_at","last_run_finished_at",
+  "local_data_updated_at",
+  "source_url","source_last_modified_at","source_etag",
+  "source_zip_sha256","source_zip_bytes"
+], hide_empty={"last_run_skip_reason"})
+
+show_block("scheduler", [
+  "crontab_available",
+  "daily_3am_entry_present",
+  "daily_3am_entry_installed_this_run",
+  "daily_3am_entry",
+  "installed_for_user",
+  "installed_for_uid",
+  "installed_for_gid",
+])
+PY
 }
 
 # -----------------------------
-# Main
+# Argument parsing
 # -----------------------------
-BOOTSTRAP_STARTED_UTC="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+MODE_STATUS="no"
+FLAG_COLDSTART="no"
+FLAG_ROTATE_SECRETS="no"
+FLAG_FORCE="no"
+FLAG_CI="no"
+FLAG_LOG_SANITY="no"
+
+if [ "${#}" -gt 0 ]; then
+  while [ "${#}" -gt 0 ]; do
+    case "$1" in
+      --status) MODE_STATUS="yes" ;;
+      --coldstart) FLAG_COLDSTART="yes" ;;
+      --rotate-secrets) FLAG_ROTATE_SECRETS="yes" ;;
+      --force) FLAG_FORCE="yes" ;;
+      --ci) FLAG_CI="yes" ;;
+      --log-sanity) FLAG_LOG_SANITY="yes" ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "Unknown arg: $1" ;;
+    esac
+    shift
+  done
+fi
+
+if [ "${FLAG_FORCE}" = "yes" ]; then
+  FLAG_ROTATE_SECRETS="yes"
+fi
+
+if [ "${FLAG_ROTATE_SECRETS}" = "yes" ] && [ "${FLAG_COLDSTART}" != "yes" ]; then
+  die "--rotate-secrets is allowed only with --coldstart"
+fi
+if [ "${FLAG_FORCE}" = "yes" ] && [ "${FLAG_COLDSTART}" != "yes" ]; then
+  die "--force implies secrets rotation and therefore requires --coldstart"
+fi
+
+log "Mode resolved: fresh-install=no coldstart=${FLAG_COLDSTART} rotate-secrets=${FLAG_ROTATE_SECRETS} ci=${FLAG_CI}"
+
+if [ "${MODE_STATUS}" = "yes" ]; then
+  status_print
+  exit 0
+fi
+
+# -----------------------------
+# Main flow
+# -----------------------------
+ensure_dirs
+STARTED_AT="$(utc_now_iso)"
+START_EPOCH="$(date +%s)"
 
 log "ARCS control starting..."
-log "Project root: $ROOT_DIR"
+log "Project root: ${PROJECT_ROOT}"
 
-if [ "$COLDSTART" = "yes" ]; then
-  coldstart_wipe
-fi
+# Configure daily updates via cron (non-fatal; same user that runs arcsctl.sh)
+ensure_cron_daily
 
-if [ "$ROTATE_SECRETS" = "yes" ]; then
-  rotate_secrets
+if [ "${FLAG_COLDSTART}" = "yes" ]; then
+  log ""
+  log "NOTE: A coldstart (fresh install) may take several minutes to complete."
+  log ""
+  log "Coldstart requested: stopping stack + wiping named volumes..."
+  set +e
+  compose down --remove-orphans >/dev/null 2>&1
+  set -e
+
+  volume_rm_if_exists "${VOL_DB_DATA}"
+  volume_rm_if_exists "${VOL_CACHE}"
+  log "Coldstart wipe complete."
+
+  if [ "${FLAG_ROTATE_SECRETS}" = "yes" ]; then
+    log "Rotating secrets (coldstart only)..."
+    write_secrets
+    log "Secrets written:"
+    log "  ${SECRET_DB_ROOT}"
+    log "  ${SECRET_DB_USER}"
+    log "  ${SECRET_XML_API}"
+  else
+    require_secrets_exist
+    log "Using existing secrets (no rotation):"
+    log "  ${SECRET_DB_ROOT}"
+    log "  ${SECRET_DB_USER}"
+    log "  ${SECRET_XML_API}"
+  fi
 else
-  need_file "$MDB_ROOT_PW_FILE"
-  need_file "$MDB_USER_PW_FILE"
-  need_file "$XML_API_PW_FILE"
+  require_secrets_exist
   log "Using existing secrets (no rotation):"
-  log "  $MDB_ROOT_PW_FILE"
-  log "  $MDB_USER_PW_FILE"
-  log "  $XML_API_PW_FILE"
+  log "  ${SECRET_DB_ROOT}"
+  log "  ${SECRET_DB_USER}"
+  log "  ${SECRET_XML_API}"
 fi
 
-start_services
-run_sanity_check
+log "Starting MariaDB..."
+compose up -d "${SVC_DB}" >/dev/null
+wait_for_db_healthy 90 2
 
-TOTAL_END_EPOCH="$(date +%s)"
-TOTAL_ELAPSED=$((TOTAL_END_EPOCH - SCRIPT_START_EPOCH))
-BOOTSTRAP_FINISHED_UTC="$(date -u '+%Y-%m-%dT%H%M%SZ')"
+run_importer
+ensure_xml_api_user
 
-# Fix timestamp format typo if any (keep it strict RFC3339 with Z)
-BOOTSTRAP_FINISHED_UTC="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+log "Starting runtime services (xml-api + web-ui)..."
+compose up -d "${SVC_API}" "${SVC_UI}" >/dev/null
 
-log "Done. Total elapsed $(fmt_seconds "$TOTAL_ELAPSED")."
+run_sanity "${FLAG_CI}" "${FLAG_LOG_SANITY}"
 
-# Legacy: admin/.bootstrap_complete (quick grepping)
-{
-  echo "bootstrap_started_at_utc=${BOOTSTRAP_STARTED_UTC}"
-  echo "bootstrap_completed_at_utc=${BOOTSTRAP_FINISHED_UTC}"
-  echo "result=success"
-  echo "elapsed_seconds=${TOTAL_ELAPSED}"
-  echo "elapsed_human=$(fmt_seconds "$TOTAL_ELAPSED")"
-  echo "fresh_install=${FRESH_INSTALL:-unknown}"
-  echo "coldstart=${COLDSTART}"
-  echo "rotate_secrets=${ROTATE_SECRETS}"
-  echo "ci_mode=${CI}"
-} > "$BOOTSTRAP_MARKER_LEGACY"
+END_EPOCH="$(date +%s)"
+ELAPSED="$((END_EPOCH - START_EPOCH))"
+if [ "${ELAPSED}" -lt 3600 ]; then
+  ELAPSED_HUMAN="$(printf "%02d:%02d" $((ELAPSED/60)) $((ELAPSED%60)))"
+else
+  ELAPSED_HUMAN="$(printf "%02d:%02d:%02d" $((ELAPSED/3600)) $(((ELAPSED%3600)/60)) $((ELAPSED%60)))"
+fi
+COMPLETED_AT="$(utc_now_iso)"
 
-# Canonical: logs/arcs-state.json (bootstrap namespace)
-merge_bootstrap_state_json \
-  "$BOOTSTRAP_STARTED_UTC" \
-  "$BOOTSTRAP_FINISHED_UTC" \
-  "success" \
-  "${TOTAL_ELAPSED}" \
-  "$(fmt_seconds "$TOTAL_ELAPSED")"
+json_write_bootstrap "${STARTED_AT}" "${COMPLETED_AT}" "${ELAPSED}" "${ELAPSED_HUMAN}" "${FLAG_COLDSTART}" "${FLAG_ROTATE_SECRETS}" "${FLAG_CI}" "success"
 
-log "Bootstrap metadata written:"
-log "  Canonical: logs/arcs-state.json (bootstrap)"
-log "  Legacy:    admin/.bootstrap_complete"
+log "Done. Total elapsed ${ELAPSED_HUMAN}."
+log "State updated: logs/arcs-state.json"
+
+exit 0
